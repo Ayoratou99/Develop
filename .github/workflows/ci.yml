@@ -36,12 +36,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.9", "3.12"]
-    env:
-      # Les tests n'écrivent jamais dans ~/.develop du runner : tout va dans le dossier temporaire.
-      DEVELOP_HOME: ${{ runner.temp }}/develop-home
-      CI_LOGS: ${{ runner.temp }}/ci-logs
     steps:
       - uses: actions/checkout@v4
+
+      # Les tests n'écrivent jamais dans ~/.develop du runner : tout va dans le dossier temporaire.
+      # (Le contexte « runner » n'existe pas dans « env » au niveau du job : on passe par GITHUB_ENV.)
+      - name: Dossiers temporaires (DEVELOP_HOME, CI_LOGS)
+        shell: bash
+        run: |
+          echo "DEVELOP_HOME=${RUNNER_TEMP}/develop-home" >> "$GITHUB_ENV"
+          echo "CI_LOGS=${RUNNER_TEMP}/ci-logs" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -105,10 +109,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    env:
-      CI_LOGS: ${{ runner.temp }}/ci-logs
     steps:
       - uses: actions/checkout@v4
+
+      # Le contexte « runner » n'existe pas dans « env » au niveau du job : on passe par GITHUB_ENV.
+      - name: Dossier des journaux (CI_LOGS)
+        shell: bash
+        run: echo "CI_LOGS=${RUNNER_TEMP}/ci-logs" >> "$GITHUB_ENV"
 
       # Garantit qu'un Python >= 3.9 est dans le PATH ; les scripts choisissent eux-mêmes leur Python,
       # exactement comme chez l'utilisateur.
