@@ -11,20 +11,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
+import statistics
 import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
 
-from develop.chat.budget import MIN_TOOL_BUDGET, Budget, compute_budget, estimate_tokens, tool_specs_tokens
+from develop.chat.budget import (MIN_TOOL_BUDGET, Budget, compute_budget, estimate_tokens, read_time_s,
+                                 tool_specs_tokens)
 from develop.chat.context_builder import (ContextPack, LocalHit, Source, add_tool_sources, build_context,
                                           render_sources_as_text, render_sources_for_model)
 from develop.chat.prompts import HISTORY_SUMMARY_PREFIX, build_system_prompt
 from develop.chat.tools import TOOL_SPECS, ToolExecutor, ToolResult
+from develop.llm.advisor import PREFILL_TPS_MAX, PREFILL_TPS_MIN, estimate_prefill_tps, model_params_b
 from develop.llm.base import (ChatMessage, LLMClient, LLMError, LLMUnavailable, ModelInfo, ModelNotFound, ToolCall,
-                              parse_text_tool_calls)
+                              model_is_loaded, parse_text_tool_calls)
 from develop.llm.offline_guard import OfflineViolation
 from develop.search.query import FOLLOWUP_MARKER  # le marqueur est reconnu par analyze_query : même source de vérité
 from develop.storage import Database, StorageError
@@ -43,7 +47,21 @@ STATUS_SEARCHING = "Recherche dans le projet…"
 STATUS_FOLLOWUP = "Question de suivi : contexte « %s » conservé"
 STATUS_SMALLTALK = "Petite conversation : réponse directe, sans recherche ni modèle."
 STATUS_LOADING = "Chargement du modèle %s en mémoire (jusqu'à 30 s la première fois)…"
-STATUS_READING = "Le modèle lit %d sources (≈ %d tokens) avant de répondre…"
+STATUS_READING = "Le modèle lit %d sources (≈ %d tokens, ~%d s estimées) avant de répondre…"
+# Vitesse de préremplissage mesurée (tokens du prompt *non cachés* ÷ délai jusqu'au premier fragment de texte), persistée
+# par modèle dans la base : meta ``llm_prefill_tps:<modèle>`` = {"engine", "v", "samples": [≤ PREFILL_SAMPLES], "median",
+# "avg", "updated_at"}. Le moteur garde en cache le préfixe commun avec ses requêtes précédentes (Ollama : cache KV par
+# slot) et ``usage.prompt_tokens`` compte pourtant tout le prompt : la part en cache est estimée par le plus long
+# préfixe commun avec les derniers prompts envoyés à ce modèle et retirée du compte, sinon une question reposée dans
+# une nouvelle conversation (prompt entièrement en cache, première lettre en < 1 s) vaudrait 2 000 tok/s et la borne de
+# latence lâcherait pour les questions suivantes. La valeur retenue est la médiane (basse) des mesures : une mesure
+# aberrante isolée (cache d'un autre slot, redémarrage de l'outil, machine occupée) ne la déplace pas.
+PREFILL_META_KEY = "llm_prefill_tps:%s"
+PREFILL_META_VERSION = 2  # les mesures d'avant la correction du cache (v1, gonflées) ne sont pas relues
+PREFILL_SAMPLES = 5  # médiane des 5 dernières mesures
+PREFILL_MIN_PROMPT_TOKENS = 256  # en dessous (tokens non cachés), la mesure est du bruit (latence du moteur, pas sa vitesse)
+PREFILL_LOAD_MAX_S = 1.0  # au-delà, l'appel a (re)chargé le modèle (Ollama : ``load_duration``) : son délai n'est pas une lecture
+PREFILL_RECENT_PROMPTS = 4  # prompts gardés par modèle pour estimer la part en cache (≈ slots parallèles du moteur)
 # Question « de suivi » (enrichie du tour précédent) : elle s'ouvre sur un mot de liaison (« et les champs ? »,
 # « ok mais pourquoi ? ») ou ne nomme aucun sujet à elle — ni identifiant, chemin, route ou table, ni mot-clé autre
 # qu'un mot d'*aspect* (« champs », « validation », « définition »… : une facette du sujet précédent, pas un sujet).
@@ -227,6 +245,79 @@ def _message_tokens(msg: ChatMessage) -> int:
     if msg.tool_calls:
         n += sum(estimate_tokens(json.dumps(c.arguments, ensure_ascii=False)) + 8 for c in msg.tool_calls)
     return n
+
+
+def _prefill_samples(db: Any, engine: str, model: str) -> List[float]:
+    """Mesures enregistrées pour ``model`` (même moteur), les plus anciennes d'abord ; ``[]`` si rien d'exploitable."""
+    if db is None or not model:
+        return []
+    try:
+        raw = db.get_meta(PREFILL_META_KEY % model)
+    except Exception as exc:  # noqa: BLE001 - base fermée : comme sans mesure
+        logger.debug("mesures de préremplissage illisibles pour %s: %s", model, exc)
+        return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if data.get("v") != PREFILL_META_VERSION:
+        return []  # mesures d'un ancien format (prompt entier compté, cache compris) : gonflées, on repart de zéro
+    stored_engine = str(data.get("engine") or "")
+    if engine and stored_engine and stored_engine != engine:
+        return []  # même nom de modèle sur un autre moteur : rien de comparable
+    samples: List[float] = []
+    for value in data.get("samples") or []:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            samples.append(f)
+    return samples[-PREFILL_SAMPLES:]
+
+
+def _prefill_retained(samples: Sequence[float]) -> float:
+    """Valeur retenue d'une série de mesures : la médiane basse (la plus petite des deux centrales quand le nombre
+    est pair). Une mesure isolée trop haute (prompt en cache non détecté) ou trop basse (machine occupée) ne la
+    déplace pas, et entre deux candidates c'est la prudente : surestimer la vitesse coûte des minutes d'attente,
+    la sous-estimer quelques sources."""
+    return round(float(statistics.median_low(sorted(samples))), 1)
+
+
+def load_prefill_tps(db: Any, engine: str, model: str) -> Optional[float]:
+    """Vitesse de préremplissage mesurée (tokens/s, médiane des :data:`PREFILL_SAMPLES` dernières mesures) de
+    ``model`` sur ``engine``, lue dans la base ; ``None`` sans mesure."""
+    samples = _prefill_samples(db, engine, model)
+    if not samples:
+        return None
+    return _prefill_retained(samples)
+
+
+def record_prefill_tps(db: Any, engine: str, model: str, tps: float) -> Optional[float]:
+    """Ajoute une mesure (bornée entre :data:`PREFILL_TPS_MIN` et :data:`PREFILL_TPS_MAX`) aux mesures de ``model``
+    dans la base ; renvoie la nouvelle valeur retenue (médiane, :func:`_prefill_retained`), ``None`` si la mesure
+    est invalide ou la base absente."""
+    try:
+        value = float(tps)
+    except (TypeError, ValueError):
+        return None
+    if db is None or not model or not value > 0:
+        return None
+    value = min(PREFILL_TPS_MAX, max(PREFILL_TPS_MIN, value))
+    samples = (_prefill_samples(db, engine, model) + [round(value, 1)])[-PREFILL_SAMPLES:]
+    median = _prefill_retained(samples)
+    avg = round(sum(samples) / len(samples), 1)
+    try:
+        db.set_meta(PREFILL_META_KEY % model, json.dumps({"engine": engine, "v": PREFILL_META_VERSION, "samples": samples,
+                                                         "median": median, "avg": avg, "updated_at": time.time()}))
+    except Exception as exc:  # noqa: BLE001 - jamais de réponse perdue pour une statistique
+        logger.debug("mesure de préremplissage non enregistrée pour %s: %s", model, exc)
+        return None
+    return median
 
 
 def find_invalid_citations(text: str, valid_refs: Sequence[str]) -> List[str]:
@@ -663,6 +754,9 @@ class ChatOrchestrator:
         self.model_info = model_info
         self.today = today or time.strftime("%Y-%m-%d")
         self.tools = ToolExecutor(db, workspace, search_engine, impact_analyzer, git)
+        # derniers prompts envoyés, par modèle (texte rendu par :meth:`_prompt_text`, réponse comprise) : ce que le
+        # moteur a probablement encore en cache de préfixe ; voir :meth:`_cached_fraction`
+        self._recent_prompts: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------------ aides
     @property
@@ -684,6 +778,26 @@ class ChatOrchestrator:
             return "native"
         return "text"
 
+    @property
+    def model_name(self) -> str:
+        return str(getattr(self.llm_cfg, "model", "") or "")
+
+    @property
+    def engine_name(self) -> str:
+        return str(getattr(self.llm, "engine", "") or getattr(self.llm_cfg, "engine", "") or "")
+
+    def prefill_tps(self) -> Tuple[float, bool]:
+        """``(tokens/s de lecture du prompt, mesuré ?)`` pour le modèle configuré : la médiane des dernières mesures
+        du chat (:func:`load_prefill_tps`) quand elle existe, sinon l'estimation du conseiller
+        (:func:`develop.llm.advisor.estimate_prefill_tps` sur ``model_info`` — taille du modèle — et le profil)."""
+        model = self.model_name
+        measured = load_prefill_tps(self.db, self.engine_name, model)
+        if measured:
+            return measured, True
+        # model_info porte la taille (« 27B ») quand le moteur la donne ; sinon le nom du modèle (« qwen3:14b »)
+        described: Any = self.model_info if (self.model_info is not None and model_params_b(self.model_info)) else model
+        return estimate_prefill_tps(described, self.profile), False
+
     def _plan(self, tools_mode: str, intent: str, max_context_tokens: Optional[int],
               user_text: str) -> Tuple[Budget, str]:
         """Budget de la question avec les consignes système réellement mesurées ; renvoie ``(budget, consignes)``.
@@ -692,11 +806,14 @@ class ChatOrchestrator:
         une première passe fixe ``num_ctx`` et le mode, les consignes sont construites puis mesurées
         (définitions d'outils natifs comprises) et le budget recalculé avec cette mesure. Si cette
         mesure ne laisse pas de place aux outils, le budget revient sans outils et les consignes sont
-        reconstruites et remesurées dans ce mode. Le mode effectif est ``budget.tools_mode``.
+        reconstruites et remesurées dans ce mode. Le mode effectif est ``budget.tools_mode``. Le
+        contexte est borné par la vitesse de lecture du modèle (:meth:`prefill_tps`, mesurée sinon
+        estimée) et l'objectif ``first_token_target_s`` de la configuration.
         """
         cfg, info, prof = self.llm_cfg, self.model_info, self.profile
         name, repos = getattr(self.workspace, "name", ""), self._repos_summary()
         question_tokens = estimate_tokens(user_text.strip()) + USER_FRAME_TOKENS
+        tps, _ = self.prefill_tps()
 
         def measured(text: str, mode: str) -> int:
             return estimate_tokens(text) + (tool_specs_tokens() if mode == "native" else 0)
@@ -706,14 +823,15 @@ class ChatOrchestrator:
             return b.source[idx:] if idx >= 0 else ""
 
         budget = compute_budget(cfg, info, prof, intent, max_context_tokens, tools_mode=tools_mode,
-                                question_tokens=question_tokens)
+                                question_tokens=question_tokens, prefill_tps=tps)
         reason = downgrade_reason(budget)
         system_text = ""
         for _ in range(2):  # au plus : mesure → repli sans outils → nouvelle mesure
             mode = budget.tools_mode
             system_text = build_system_prompt(mode, budget, name, repos, self.today)
             budget = compute_budget(cfg, info, prof, intent, max_context_tokens, tools_mode=mode,
-                                    system_tokens=measured(system_text, mode), question_tokens=question_tokens)
+                                    system_tokens=measured(system_text, mode), question_tokens=question_tokens,
+                                    prefill_tps=tps)
             if budget.tools_mode == mode:
                 break
             reason = downgrade_reason(budget) or reason
@@ -912,7 +1030,8 @@ class ChatOrchestrator:
             return None
 
     def _budget_dict(self, budget: Budget, pack: Optional[ContextPack], rounds: int, context_tokens: int,
-                     tools_tokens_used: int = 0, tools_tokens_max: int = 0) -> Dict[str, Any]:
+                     tools_tokens_used: int = 0, tools_tokens_max: int = 0, first_token_s: Optional[float] = None,
+                     prefill_tps: Optional[float] = None) -> Dict[str, Any]:
         """``budget`` de l'événement ``done`` : le contexte initial et les tours d'outils sont comptés à part.
 
         - ``context_tokens_used`` ≤ ``max_context_tokens`` : les passages retenus par la recherche initiale et
@@ -920,28 +1039,117 @@ class ChatOrchestrator:
         - ``tools_tokens_used`` / ``tools_tokens_max`` : ce que les tours d'outils ont consommé (appels,
           résultats, sources ajoutées, avis d'épuisement) et ce que la fenêtre leur laissait une fois le prompt
           réel et la réserve de réponse comptés ; 0 sans outils ;
-        - ``sources_tokens`` : tous les blocs de sources citables, contexte initial et outils compris.
+        - ``sources_tokens`` : tous les blocs de sources citables, contexte initial et outils compris ;
+        - ``prefill_tps`` : vitesse de lecture du modèle (tokens/s) retenue après ce tour (médiane des dernières
+          mesures, mise à jour par la mesure du tour, sinon la valeur — mesurée ou estimée — qui a servi au budget) ;
+          ``first_token_s`` : délai mesuré jusqu'au premier fragment du premier appel (``null`` sans mesure) ;
+          ``latency_capped`` : vrai si la borne de latence a réduit le contexte.
         """
+        tps = prefill_tps if prefill_tps is not None else budget.prefill_tps
         return {"num_ctx": budget.num_ctx, "context_tokens_used": max(0, int(context_tokens or 0)),
                 "max_context_tokens": budget.context_tokens_max, "sources_tokens": pack.tokens_used if pack else 0,
                 "tools_tokens_used": max(0, int(tools_tokens_used or 0)),
                 "tools_tokens_max": max(0, int(tools_tokens_max or 0)), "tool_rounds": rounds,
-                "answer_reserve": budget.answer_reserve, "tools_mode": budget.tools_mode, "source": budget.source}
+                "answer_reserve": budget.answer_reserve, "tools_mode": budget.tools_mode, "source": budget.source,
+                "prefill_tps": round(float(tps), 1) if tps else None,
+                "first_token_s": round(float(first_token_s), 2) if first_token_s is not None else None,
+                "latency_capped": bool(budget.latency_capped)}
 
     # ------------------------------------------------------------------ flux principal
-    async def _announce_model_phase(self, n_sources: int, tokens: int):
-        """Événements ``status`` avant l'appel du modèle : chargement si le moteur dit qu'il n'est pas en
-        mémoire (Ollama : /api/ps), puis lecture des sources. Jamais d'exception."""
-        model = getattr(self.llm_cfg, "model", "") or ""
+    async def _model_needs_loading(self) -> bool:
+        """Vrai si le moteur dit (Ollama : /api/ps) que le modèle configuré n'est pas en mémoire — une liste vide
+        (rien en mémoire : keep_alive expiré, ``develop ask`` sans préchauffage, après ``POST /api/llm/unload``) le dit
+        aussi ; faux s'il l'est ou si le moteur ne le dit pas (``loaded_models()`` → ``None`` : serveur compatible
+        OpenAI ; erreur ou lenteur : moteur injoignable). Jamais d'exception."""
+        model = self.model_name
+        if not model:
+            return False
         try:
             loaded = await asyncio.wait_for(self.llm.loaded_models(), 3.0)
-        except Exception:  # noqa: BLE001 - moteur muet ou lent : on n'annonce rien de plus
-            loaded = []
-        if model and loaded:
-            base = model.split(":")[0]
-            if not any(m == model or m.split(":")[0] == base for m in loaded):
-                yield _event("status", text=STATUS_LOADING % model)
-        yield _event("status", text=STATUS_READING % (n_sources, tokens))
+        except Exception:  # noqa: BLE001 - moteur muet ou lent : on ne conclut rien
+            loaded = None
+        if loaded is None:
+            return False
+        return not model_is_loaded(model, loaded)  # même règle que GET /api/llm/state (qwen3:14b ≠ qwen3:8b)
+
+    def _announce_model_phase(self, needs_loading: bool, n_sources: int, tokens: int,
+                              read_s: Optional[float]) -> List[ChatEvent]:
+        """Événements ``status`` avant l'appel du modèle : chargement si le moteur n'a pas le modèle en mémoire,
+        puis lecture des sources avec le délai estimé (prompt entier ÷ vitesse de lecture, au moins 1 s)."""
+        events: List[ChatEvent] = []
+        if needs_loading:
+            events.append(_event("status", text=STATUS_LOADING % self.model_name))
+        seconds = max(1, int(math.ceil(read_s))) if read_s is not None else 0
+        events.append(_event("status", text=STATUS_READING % (n_sources, tokens, seconds)))
+        return events
+
+    @staticmethod
+    def _prompt_text(messages: Sequence[ChatMessage], tools: Optional[Sequence[Any]] = None, answer: str = "") -> str:
+        """Rendu textuel d'un appel au modèle (outils proposés, messages avec rôle et appels d'outils, puis la réponse
+        générée) : la forme sous laquelle les prompts sont comparés pour estimer leur préfixe commun. Le gabarit du
+        moteur ajoute ses propres marqueurs, mais le préfixe commun de deux prompts y diverge au même endroit."""
+        parts = ["tools: %s\n" % ", ".join(str(getattr(t, "name", "") or "") for t in (tools or []))]
+        for m in messages:
+            parts.append("%s\n%s\n" % (m.role, m.content))
+            for c in m.tool_calls or []:
+                parts.append("%s(%s)\n" % (c.name, json.dumps(c.arguments, ensure_ascii=False, sort_keys=True)))
+        if answer:
+            parts.append("assistant\n%s\n" % answer)
+        return "".join(parts)
+
+    def _cached_fraction(self, model: str, prompt_text: str) -> float:
+        """Part (0–1) de ``prompt_text`` que le moteur a probablement déjà en cache : le plus long préfixe commun
+        avec les :data:`PREFILL_RECENT_PROMPTS` derniers prompts envoyés à ``model`` par cet orchestrateur (Ollama
+        réutilise le cache KV du préfixe commun avec une requête précédente du même modèle, réponse comprise).
+        0 sans prompt précédent — après un redémarrage de l'outil, le cache du moteur peut être chaud : une mesure
+        gonflée isolée, que la médiane absorbe."""
+        if not prompt_text:
+            return 0.0
+        best = 0
+        for previous in self._recent_prompts.get(model, []):
+            best = max(best, len(os.path.commonprefix([previous, prompt_text])))
+        return min(1.0, best / len(prompt_text))
+
+    def _remember_prompt(self, model: str, prompt_text: str) -> None:
+        """Garde ``prompt_text`` parmi les derniers prompts envoyés à ``model`` (voir :meth:`_cached_fraction`)."""
+        if not model or not prompt_text:
+            return
+        recent = [p for p in self._recent_prompts.get(model, []) if p != prompt_text]
+        recent.append(prompt_text)
+        self._recent_prompts[model] = recent[-PREFILL_RECENT_PROMPTS:]
+
+    def _record_prefill(self, prompt_tokens: Optional[int], first_token_s: Optional[float],
+                        load_s: Optional[float] = None, cached_fraction: float = 0.0) -> Optional[float]:
+        """Enregistre la vitesse de lecture mesurée sur un appel (tokens du prompt non cachés ÷ délai jusqu'au premier
+        fragment de texte) et renvoie la nouvelle valeur retenue (médiane des dernières mesures) ; ``None`` si la mesure
+        n'est pas exploitable : prompt non caché trop court pour dominer la latence du moteur (moins de
+        :data:`PREFILL_MIN_PROMPT_TOKENS` tokens — une question reposée telle quelle dans une nouvelle conversation
+        est entièrement en cache, le délai ne mesure rien), délai nul, ou ``load_s`` — temps de chargement du modèle
+        rapporté par le moteur pour cet appel, ``usage.load_duration_ms`` d'Ollama — au-delà de
+        :data:`PREFILL_LOAD_MAX_S` (le délai mêlait chargement et lecture). ``prompt_tokens`` compte tout le prompt,
+        cache compris (``prompt_eval_count`` d'Ollama) ; ``cached_fraction`` (:meth:`_cached_fraction`) en est retirée."""
+        try:
+            total = int(prompt_tokens or 0)
+            delay = float(first_token_s or 0.0)
+            loading = float(load_s or 0.0)
+            cached = min(1.0, max(0.0, float(cached_fraction or 0.0)))
+        except (TypeError, ValueError):
+            return None
+        if loading > PREFILL_LOAD_MAX_S:
+            logger.debug("préremplissage %s : appel non mesuré, le moteur a chargé le modèle pendant %.1f s",
+                         self.model_name, loading)
+            return None
+        tokens = int(round(total * (1.0 - cached)))
+        if tokens < PREFILL_MIN_PROMPT_TOKENS or delay <= 0:
+            if total >= PREFILL_MIN_PROMPT_TOKENS and delay > 0:
+                logger.debug("préremplissage %s : appel non mesuré, %d tokens sur %d probablement en cache (%.2f s)",
+                             self.model_name, total - tokens, total, delay)
+            return None
+        retained = record_prefill_tps(self.db, self.engine_name, self.model_name, tokens / delay)
+        if retained is not None:
+            logger.debug("préremplissage %s : %d tokens non cachés (sur %d) en %.2f s → %.0f tok/s (retenu %.0f)",
+                         self.model_name, tokens, total, delay, tokens / delay, retained)
+        return retained
 
     async def respond(self, conversation_id: int, user_text: str, mode: str = "auto",
                       max_context_tokens: Optional[int] = None,
@@ -1004,11 +1212,6 @@ class ChatOrchestrator:
             pack = build_context(hits, budget.context_tokens_max, intent, db=self.db)
             context_tokens = pack.tokens_used  # contexte initial seul : les outils ajoutent ensuite au pack
             yield _event("sources", items=[s.to_dict() for s in pack.sources])
-            if mode != "search_only":
-                # L'attente la plus longue est la lecture du contexte par le modèle (préremplissage), précédée
-                # du chargement du modèle s'il a été déchargé : on le dit, au lieu de laisser « Recherche… ».
-                async for ev in self._announce_model_phase(len(pack.sources), pack.tokens_used):
-                    yield ev
 
             # (5) recherche seule : pas de LLM
             if mode == "search_only":
@@ -1044,6 +1247,14 @@ class ChatOrchestrator:
             # ce que la fenêtre laisse aux tours d'outils (rapporté dans ``done.budget``) ; 0 sans outils
             tools_tokens_max = max(0, tools_available()) if tools_mode != "none" else 0
 
+            # (7 bis) L'attente la plus longue est la lecture du prompt par le modèle (préremplissage), précédée
+            #         du chargement du modèle s'il a été déchargé : on le dit, avec le délai estimé (prompt entier
+            #         ÷ vitesse de lecture mesurée ou estimée), au lieu de laisser « Recherche… ».
+            needs_loading = await self._model_needs_loading()
+            for ev in self._announce_model_phase(needs_loading, len(pack.sources), pack.tokens_used,
+                                                 read_time_s(prompt_tokens_est + spec_tokens, budget.prefill_tps)):
+                yield ev
+
             # (8) boucle de génération / outils
             model = str(getattr(self.llm_cfg, "model", "") or "")
             temperature = float(getattr(self.llm_cfg, "temperature", 0.2) or 0.2)
@@ -1051,6 +1262,9 @@ class ChatOrchestrator:
             cancelled = False
             force_final = False
             seen_call_ids: Set[str] = set()
+            first_token_s: Optional[float] = None  # délai jusqu'au premier fragment du premier appel
+            prefill_avg: Optional[float] = None  # valeur retenue (médiane) mise à jour par la mesure de ce tour
+            calls_made = 0
             while True:
                 allow_tools = tools_mode != "none" and not force_final and rounds < budget.tool_rounds_max
                 round_text = ""
@@ -1061,18 +1275,44 @@ class ChatOrchestrator:
                 text_filter: Optional[_ToolLineFilter] = _ToolLineFilter() if tools_mode == "text" else None
                 native_calls: List[ToolCall] = []
                 extra_llm_kwargs: Dict[str, Any] = {}
-                if self.model_info is not None and "thinking" in (getattr(self.model_info, "capabilities", None) or []):
-                    # Réflexion interne : coûteuse (minutes sur un 27B) ; désactivée sauf demande explicite.
-                    extra_llm_kwargs["think"] = bool(getattr(self.llm_cfg, "think", False))
+                want_think = bool(getattr(self.llm_cfg, "think", False))
+                caps = getattr(self.model_info, "capabilities", None) or []
+                if getattr(self.llm, "engine", "") == "ollama" and not want_think:
+                    # Équivalent de « /set nothink » : toujours envoyé à Ollama (accepté même par un modèle sans
+                    # réflexion), sinon un modèle Qwen 3 réfléchit par défaut et multiplie le temps de réponse.
+                    extra_llm_kwargs["think"] = False
+                elif want_think and self.model_info is not None and "thinking" in caps:
+                    # Activer la réflexion n'est possible que si le modèle la supporte (Ollama refuse sinon).
+                    extra_llm_kwargs["think"] = True
+                tools_sent = TOOL_SPECS if (allow_tools and tools_mode == "native") else None
                 stream = self.llm.chat_stream(messages, model, temperature=temperature, num_ctx=budget.num_ctx,
-                                              tools=TOOL_SPECS if (allow_tools and tools_mode == "native") else None,
-                                              max_tokens=budget.answer_reserve, **extra_llm_kwargs)
+                                              tools=tools_sent, max_tokens=budget.answer_reserve, **extra_llm_kwargs)
+                # part du prompt que le moteur a probablement en cache (préfixe commun avec ses prompts précédents :
+                # consignes, historique, sources relues, voire le prompt entier d'une question reposée) : retirée de
+                # la mesure de vitesse de lecture ; le prompt est gardé après l'appel pour les comparaisons suivantes
+                prompt_text = self._prompt_text(messages, tools_sent)
+                cached_fraction = self._cached_fraction(model, prompt_text) if calls_made == 0 else 0.0
+                sent_at = time.monotonic()  # la requête part au premier parcours du flux
+                first_chunk_at: Optional[float] = None  # premier fragment, quel qu'il soit (délai perçu)
+                first_text_at: Optional[float] = None  # premier fragment de texte, s'il précède tout appel d'outil
+                prefill_measurable = True
+                call_usage: Dict[str, int] = {}
                 try:
                     async for chunk in stream:
+                        now = time.monotonic()
+                        if first_chunk_at is None:
+                            first_chunk_at = now
                         if cancel is not None and cancel.is_set():
                             cancelled = True
                             break
                         text = getattr(chunk, "text", "") or ""
+                        if prefill_measurable and first_text_at is None:
+                            if getattr(chunk, "tool_calls", None):
+                                # Ollama n'émet un appel d'outil qu'une fois son JSON entièrement généré (quelques
+                                # secondes) : ce délai mêle lecture et génération, il ne mesure pas la lecture.
+                                prefill_measurable = False
+                            elif text:
+                                first_text_at = now
                         if text:
                             round_text += text
                             if text_filter is not None:
@@ -1088,6 +1328,7 @@ class ChatOrchestrator:
                         for key, value in chunk_usage.items():
                             try:
                                 usage[key] = usage.get(key, 0) + int(value)
+                                call_usage[key] = call_usage.get(key, 0) + int(value)
                             except (TypeError, ValueError):
                                 continue
                 finally:
@@ -1097,6 +1338,22 @@ class ChatOrchestrator:
                             await aclose()
                         except Exception:  # noqa: BLE001
                             pass
+                calls_made += 1
+                if first_chunk_at is not None:
+                    # le moteur a lu ce prompt (et généré la suite) : c'est son cache de préfixe pour l'appel suivant
+                    self._remember_prompt(model, self._prompt_text(messages, tools_sent, round_text))
+                if calls_made == 1 and first_chunk_at is not None:
+                    # Le premier appel lit le contexte frais : son délai jusqu'au premier fragment de texte mesure la
+                    # vitesse de lecture du modèle (usage.prompt_tokens hors part en cache ÷ délai). Les tours
+                    # d'outils suivants relisent un prompt en grande partie en cache ; un modèle qui se charge ou
+                    # réfléchit avant d'écrire attend pour d'autres raisons ; un appel d'outil n'est émis qu'une fois
+                    # son JSON généré : ces appels ne sont pas mesurés (``first_token_s`` reste le délai perçu jusqu'au
+                    # premier fragment).
+                    first_token_s = first_chunk_at - sent_at
+                    if first_text_at is not None and not needs_loading and not extra_llm_kwargs.get("think"):
+                        prefill_avg = self._record_prefill(call_usage.get("prompt_tokens"), first_text_at - sent_at,
+                                                           load_s=call_usage.get("load_duration_ms", 0) / 1000.0,
+                                                           cached_fraction=cached_fraction)
                 if cancelled:
                     rest = text_filter.flush() if text_filter is not None else ""
                     if rest:
@@ -1182,7 +1439,8 @@ class ChatOrchestrator:
 
             # (9) fin
             answer = "".join(emitted)
-            budget_info = self._budget_dict(budget, pack, rounds, context_tokens, tools_tokens_used, tools_tokens_max)
+            budget_info = self._budget_dict(budget, pack, rounds, context_tokens, tools_tokens_used, tools_tokens_max,
+                                            first_token_s=first_token_s, prefill_tps=prefill_avg)
             if cancelled:
                 message_id = self._store(conversation_id, answer, pack) if answer.strip() else None
                 stored = True

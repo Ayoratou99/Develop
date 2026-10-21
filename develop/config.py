@@ -29,6 +29,7 @@ NetworkMode = Literal["strict", "local_network"]
 
 DEFAULT_MAX_CONTEXT_CHARS = 96_000  # ≈ 24k tokens : ne bride le budget de contexte qu'au-delà de 32k de fenêtre
 LEGACY_MAX_CONTEXT_CHARS = 24_000  # ancien défaut (≈ 6k tokens), remplacé par DEFAULT_MAX_CONTEXT_CHARS à la lecture
+DEFAULT_FIRST_TOKEN_TARGET_S = 25.0  # première lettre de la réponse attendue en ≤ 25 s (borne le contexte lu par le modèle)
 
 
 class RepoConfig(BaseModel):
@@ -54,6 +55,10 @@ class LLMConfig(BaseModel):
     num_ctx: int = 8192  # fenêtre de contexte demandée au moteur
     think: bool = False  # réflexion interne (« thinking ») des modèles qui la supportent : plus précis mais bien plus lent
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS  # plafond du contexte RAG injecté dans le prompt (≈ 24k tokens)
+    # objectif de latence : première lettre de la réponse en ≤ N s ; le contexte récupéré est borné par ce que le
+    # modèle peut lire dans ce délai (vitesse de préremplissage mesurée, sinon estimée), plancher 1 500 tokens ;
+    # 0 = pas d'objectif (le contexte n'est borné que par la fenêtre)
+    first_token_target_s: float = DEFAULT_FIRST_TOKEN_TARGET_S
     api_key: str = ""  # certains serveurs compatibles OpenAI exigent une clé factice
 
     @field_validator("max_context_chars")

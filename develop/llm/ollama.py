@@ -1,4 +1,4 @@
-"""Adaptateur Ollama (http://127.0.0.1:11434) : /api/tags, /api/show, /api/chat, /api/embed."""
+"""Adaptateur Ollama (http://127.0.0.1:11434) : /api/tags, /api/show, /api/chat, /api/embed, /api/ps, /api/generate (chargement)."""
 from __future__ import annotations
 
 import json
@@ -26,6 +26,7 @@ def _msg_to_ollama(m: ChatMessage) -> Dict[str, Any]:
 
 class OllamaClient(LLMClient):
     engine = "ollama"
+    reports_loaded_models = True  # /api/ps dit ce qui est en mémoire ; /api/generate keep_alive 0 décharge
 
     def __init__(self, base_url: str = "http://127.0.0.1:11434", guard: Optional[offline_guard.OfflineGuard] = None,
                  transport: Optional[httpx.AsyncBaseTransport] = None):
@@ -159,6 +160,17 @@ class OllamaClient(LLMClient):
                             usage["prompt_tokens"] = int(data["prompt_eval_count"])
                         if "eval_count" in data:
                             usage["completion_tokens"] = int(data["eval_count"])
+                        if isinstance(data.get("load_duration"), (int, float)):
+                            # temps passé à (re)charger le modèle pour cet appel (ns → ms) : ≈ 0 s'il était déjà en
+                            # mémoire, des secondes sinon (keep_alive expiré, autre num_ctx) ; l'orchestrateur écarte
+                            # alors le délai de cet appel de sa mesure de vitesse de lecture
+                            usage["load_duration_ms"] = int(data["load_duration"] // 1_000_000)
+                        if isinstance(data.get("prompt_eval_duration"), (int, float)):
+                            # temps de lecture du prompt (ns → ms) : les tokens *non cachés* seulement, alors que
+                            # ``prompt_eval_count`` (→ ``prompt_tokens``) compte tout le prompt, cache de préfixe
+                            # compris — d'où ``prompt_tokens ÷ prompt_eval_duration`` ≫ vitesse réelle pour un prompt
+                            # déjà vu ; conservé pour le diagnostic de la mesure de lecture
+                            usage["prompt_eval_duration_ms"] = int(data["prompt_eval_duration"] // 1_000_000)
                     yield ChatChunk(text=msg.get("content") or "", tool_calls=calls, done=done, usage=usage)
                     if done:
                         return
@@ -168,19 +180,55 @@ class OllamaClient(LLMClient):
             raise LLMUnavailable("Ollama injoignable sur %s (%s)." % (self.base_url, exc.__class__.__name__)) from exc
 
     async def loaded_models(self) -> List[str]:
-        """Modèles présents en mémoire (GET /api/ps) ; [] si l'information est indisponible."""
-        try:
-            data = await self._get_json("/api/ps", timeout=3.0)
-        except LLMError:
-            return []
-        return [str(m.get("name") or m.get("model") or "") for m in (data or {}).get("models", []) if m]
+        """Modèles présents en mémoire (GET /api/ps) : ``[]`` quand Ollama n'a rien chargé — ce n'est pas « inconnu ».
+        Ollama injoignable ou ``/api/ps`` en erreur → ``LLMError`` (de :meth:`_get_json`, pas :meth:`_ps` qui
+        confondrait l'erreur avec une mémoire vide) : l'appelant ne conclut rien (ni annonce de chargement, ni temps
+        de chargement pris pour une mesure de lecture)."""
+        data = await self._get_json("/api/ps", timeout=3.0)
+        return [str(m.get("name") or m.get("model") or "")
+                for m in (data or {}).get("models", []) if isinstance(m, dict)]
 
-    async def warm(self, model: str) -> bool:
-        """Charge le modèle en mémoire (POST /api/generate sans prompt) et le garde ``KEEP_ALIVE``."""
+    async def loaded_contexts(self) -> Dict[str, Optional[int]]:
+        """``{modèle en mémoire: context_length}`` d'après GET /api/ps : la fenêtre (``num_ctx``) avec laquelle
+        Ollama a chargé le modèle ; ``None`` quand le serveur ne la donne pas (version ancienne). Même contrat que
+        :meth:`loaded_models` : ``{}`` = rien en mémoire, ``LLMError`` = Ollama injoignable (pas « vide »)."""
+        data = await self._get_json("/api/ps", timeout=3.0)
+        out: Dict[str, Optional[int]] = {}
+        for m in (data or {}).get("models", []):
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get("name") or m.get("model") or "")
+            if not name:
+                continue
+            ctx = m.get("context_length")
+            out[name] = int(ctx) if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0 else None
+        return out
+
+    async def warm(self, model: str, num_ctx: Optional[int] = None) -> bool:
+        """Charge le modèle en mémoire (POST /api/generate sans prompt) et le garde ``KEEP_ALIVE``.
+
+        ``num_ctx`` est transmis dans ``options`` : Ollama recharge le modèle dès que les options du runner
+        diffèrent (``server/sched.go``, ``needsReload``), et sans ``num_ctx`` il choisit une fenêtre « auto »
+        (4k / 32k / 256k selon la mémoire) presque toujours différente de celle que le chat demande ensuite,
+        d'où un second chargement silencieux (10 à 40 s) au premier message malgré le préchauffage."""
+        if not model:
+            return False
+        payload: Dict[str, Any] = {"model": model, "keep_alive": KEEP_ALIVE}
+        if num_ctx:
+            payload["options"] = {"num_ctx": int(num_ctx)}
+        try:
+            await self._post_json("/api/generate", payload, timeout=300.0)
+        except LLMError:
+            return False
+        return True
+
+    async def unload(self, model: str) -> bool:
+        """Décharge le modèle (POST /api/generate sans prompt avec ``keep_alive: 0``) : la RAM est libérée
+        aussitôt ; le prochain message devra recharger le modèle (≈ 10 à 40 s)."""
         if not model:
             return False
         try:
-            await self._post_json("/api/generate", {"model": model, "keep_alive": KEEP_ALIVE}, timeout=300.0)
+            await self._post_json("/api/generate", {"model": model, "keep_alive": 0}, timeout=60.0)
         except LLMError:
             return False
         return True

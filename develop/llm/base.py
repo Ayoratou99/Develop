@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence
 
 
 class LLMError(RuntimeError):
@@ -111,11 +111,46 @@ class EngineStatus:
                 "error": self.error, "models": [m.to_dict() for m in self.models]}
 
 
+def canonical_model_name(name: str) -> str:
+    """Nom de modèle comparable : un nom sans étiquette vaut ``:latest`` (``qwen3`` ↔ ``qwen3:latest``)."""
+    name = (name or "").strip()
+    return name if ":" in name else name + ":latest"
+
+
+def model_is_loaded(model: str, loaded: Sequence[str]) -> bool:
+    """Vrai si ``model`` figure dans la liste ``loaded`` du moteur (``loaded_models()``) ; un nom sans étiquette
+    vaut ``:latest`` (``qwen3`` ↔ ``qwen3:latest``), mais ``qwen3:14b`` ne se confond pas avec ``qwen3:8b``.
+    Même règle pour ``GET /api/llm/state`` et pour l'annonce « Chargement du modèle… » du chat."""
+    if not model or not loaded:
+        return False
+    wanted = canonical_model_name(model)
+    return any(canonical_model_name(m) == wanted for m in loaded)
+
+
+def loaded_context_length(model: str, contexts: Mapping[str, Optional[int]]) -> Optional[int]:
+    """Fenêtre (``num_ctx``) avec laquelle le moteur a chargé ``model`` d'après ``loaded_contexts()`` ; ``None`` si le
+    modèle n'est pas en mémoire ou si le moteur ne dit pas sa fenêtre. Même règle de nom que :func:`model_is_loaded`."""
+    if not model or not contexts:
+        return None
+    wanted = canonical_model_name(model)
+    for name, ctx in contexts.items():
+        if canonical_model_name(name) == wanted:
+            try:
+                value = int(ctx) if ctx is not None else 0
+            except (TypeError, ValueError):
+                return None
+            return value if value > 0 else None
+    return None
+
+
 class LLMClient:
     """Interface abstraite (asynchrone) d'un moteur local."""
 
     engine: str = "abstract"
     base_url: str = ""
+    # Vrai quand ``loaded_models()`` reflète réellement la mémoire du moteur (Ollama : /api/ps) ; faux quand
+    # le moteur ne le dit pas (serveur compatible OpenAI, aucun) — l'interface ne bloque alors rien.
+    reports_loaded_models: bool = False
 
     async def health(self) -> EngineStatus:
         raise NotImplementedError
@@ -134,12 +169,30 @@ class LLMClient:
     async def embed(self, texts: Sequence[str], model: str) -> List[List[float]]:
         raise NotImplementedError
 
-    async def loaded_models(self) -> List[str]:
-        """Modèles actuellement chargés en mémoire par le moteur (vide si le moteur ne le dit pas)."""
-        return []
+    async def loaded_models(self) -> Optional[List[str]]:
+        """Modèles actuellement chargés en mémoire par le moteur : ``[]`` quand il dit n'en avoir aucun, ``None``
+        quand il ne sait pas le dire (serveur compatible OpenAI, aucun moteur) ; un moteur qui devrait le dire mais ne
+        répond pas lève ``LLMError``. Le chat n'annonce « Chargement du modèle… » (et n'écarte sa mesure de vitesse
+        de lecture) que sur une liste, vide ou non — jamais sur ``None`` ni sur une erreur."""
+        return None
 
-    async def warm(self, model: str) -> bool:
-        """Précharge un modèle en mémoire pour éviter l'attente au premier message (False si non supporté)."""
+    async def loaded_contexts(self) -> Optional[Dict[str, Optional[int]]]:
+        """``{modèle en mémoire: fenêtre (num_ctx) avec laquelle il a été chargé}`` ; ``None`` pour une fenêtre
+        inconnue. Même contrat que :meth:`loaded_models` (``{}`` = rien en mémoire, ``None`` = le moteur ne sait pas
+        le dire, ``LLMError`` = il devrait mais ne répond pas) ; par défaut ses modèles, sans fenêtre."""
+        names = await self.loaded_models()
+        return None if names is None else {name: None for name in names}
+
+    async def warm(self, model: str, num_ctx: Optional[int] = None) -> bool:
+        """Précharge un modèle en mémoire pour éviter l'attente au premier message (False si non supporté).
+
+        ``num_ctx`` est la fenêtre que le chat demandera ensuite : un moteur qui recharge le modèle dès que
+        les options diffèrent (Ollama) doit le charger avec cette même fenêtre, sinon le premier message
+        paie un second chargement."""
+        return False
+
+    async def unload(self, model: str) -> bool:
+        """Décharge un modèle de la mémoire du moteur (libère la RAM) ; False si non supporté ou refusé."""
         return False
 
     async def aclose(self) -> None:

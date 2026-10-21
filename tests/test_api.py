@@ -29,6 +29,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "sample_project"
 INDEX_TIMEOUT_S = 60.0
 MODEL = "qwen2.5-coder:7b"
 EMBED = "nomic-embed-text"
+BIG_WINDOW_MODELS = {"qwen3.5:9b": "9.0B", "qwen3.8:27b": "27B"}  # fenêtre 262 144 dans le faux /api/show
 
 
 # --------------------------------------------------------------------------- faux Ollama
@@ -49,6 +50,11 @@ def fake_ollama(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if body.get("model") == "missing:latest":
             return httpx.Response(404, json={"error": "model not found"})
+        if body.get("model") in BIG_WINDOW_MODELS:  # fenêtre 262k : jamais suggérée entière
+            return httpx.Response(200, json={"details": {"family": "qwen3", "parameter_size": BIG_WINDOW_MODELS[body["model"]],
+                                                         "quantization_level": "Q4_K_M"},
+                                             "capabilities": ["completion", "tools"],
+                                             "model_info": {"qwen3.context_length": 262144, "qwen3.embedding_length": 4096}})
         return httpx.Response(200, json={"details": {"family": "qwen2", "parameter_size": "7.6B", "quantization_level": "Q4_K_M"},
                                          "capabilities": ["completion", "tools"],
                                          "model_info": {"qwen2.context_length": 32768, "qwen2.embedding_length": 3584}})
@@ -466,8 +472,17 @@ def test_llm_test_and_models(env):
     d = r.json()
     assert d["ok"] is True and d["error"] is None
     assert d["engine_status"]["ok"] and d["model_info"]["context_length"] == 32768 and d["model_info"]["supports_tools"]
-    assert d["embedding_ok"] is True and d["embedding_dim"] == 3 and d["suggested_num_ctx"] > 0
+    assert d["embedding_ok"] is True and d["embedding_dim"] == 3 and 0 < d["suggested_num_ctx"] <= 32768
+    assert d["prefill_tps"] > 0 and d["expected_first_token_s"] > 0
     assert env.state.model_info is not None and env.state.model_info.supports_tools
+    # jamais la fenêtre entière d'un modèle 262k : 32 768 au plus sous 20B, 16 384 à partir de 20B ; la vitesse de
+    # lecture estimée décroît avec la taille et le délai attendu avant la première lettre est renvoyé avec elle
+    big = c.post("/api/llm/test", json={"engine": "ollama", "base_url": "http://127.0.0.1:11434", "model": "qwen3.5:9b"}).json()
+    assert big["ok"] and big["model_info"]["context_length"] == 262144 and 0 < big["suggested_num_ctx"] <= 32768
+    huge = c.post("/api/llm/test", json={"engine": "ollama", "base_url": "http://127.0.0.1:11434", "model": "qwen3.8:27b"}).json()
+    assert huge["ok"] and huge["model_info"]["context_length"] == 262144 and 0 < huge["suggested_num_ctx"] <= 16384
+    assert 0 < huge["prefill_tps"] <= big["prefill_tps"] and huge["expected_first_token_s"] > 0
+    assert env.state.model_info.name == MODEL  # le modèle configuré reste celui de l'espace
     missing = c.post("/api/llm/test", json={"engine": "ollama", "base_url": "http://127.0.0.1:11434", "model": "missing:latest"}).json()
     assert missing["ok"] is False and "missing:latest" in missing["error"]
     none = c.post("/api/llm/test", json={"engine": "none"}).json()

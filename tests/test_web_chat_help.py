@@ -99,6 +99,33 @@ def test_chat_embeddings_banner_text_link_and_session_dismissal():
     assert "embeddingsBanner(state.status)," in src  # monté au-dessus du fil
 
 
+def test_chat_model_banner_announces_a_pending_reload_with_a_reload_button():
+    """Bandeau « Modèle … » (GET /api/llm/state) : chargé en N s ; chargé avec une autre fenêtre que celle du chat
+    (``reload_pending``) → pastille orange, « chargé avec 32 768 ≠ 40 960 : rechargement au prochain message » et
+    bouton « Recharger » (→ onLoad, comme « Charger le modèle ») à côté de « Décharger » ; sans ``loaded_num_ctx``
+    (Ollama ancien) jamais d'alerte ; chargement, non chargé et moteur sans information inchangés."""
+    out = _run_harness({})["modelBanner"]
+    loaded = out["loaded"]
+    assert loaded["class"] == "chat-model chat-model-loaded" and loaded["dots"] == ["dot dot-ok"]
+    assert _plain(loaded["text"]).startswith("Modèle qwen3:14bchargé en 12,3 s") and "≠" not in loaded["text"]
+    assert [b["text"] for b in loaded["buttons"]] == ["Décharger"] and loaded["note"] == []
+
+    pending = out["reloadPending"]
+    assert pending["class"] == "chat-model chat-model-loaded chat-model-reload" and pending["dots"] == ["dot dot-warn"]
+    assert _plain(pending["text"]).startswith("Modèle qwen3:14bchargéavec 32 768 ≠ 40 960 : rechargement au prochain message")
+    assert "chargé en" not in pending["text"]  # la durée du dernier chargement ne vaut plus : le modèle sera rechargé
+    assert [b["text"] for b in pending["buttons"]] == ["Recharger", "Décharger"]
+    reload_btn = pending["buttons"][0]
+    assert reload_btn["primary"] and "40 960" in _plain(reload_btn["title"]) and "10 à 40 s" in reload_btn["title"]
+    assert len(pending["note"]) == 1 and "32 768" in _plain(pending["note"][0]) and "rechargera le modèle au prochain message" in pending["note"][0]
+    assert out["clicks"] == ["load", "unload"]  # « Recharger » = onLoad (POST /api/llm/load), « Décharger » = onUnload
+
+    assert out["reloadWithoutWindow"]["class"] == "chat-model chat-model-loaded" and "≠" not in out["reloadWithoutWindow"]["text"]
+    assert out["loading"]["progress"] == 1 and "chargement en mémoire… 10 s (en général 10 à 40 s)" in out["loading"]["text"]
+    assert [b["text"] for b in out["unloaded"]["buttons"]] == ["Charger le modèle"] and "n'a pas pu charger" in out["unloaded"]["text"]
+    assert out["unknown"]["class"] == "chat-model chat-model-unknown" and out["none"] is None
+
+
 def test_chat_footer_reads_done_budget_in_plain_words():
     """Le pied de message garde les compteurs de done.budget et les présente en français lisible."""
     src = CHAT_JS.read_text(encoding="utf-8")
@@ -109,6 +136,48 @@ def test_chat_footer_reads_done_budget_in_plain_words():
     assert "non consultée(s), budget atteint" not in src  # ancien libellé remplacé
     css = APP_CSS.read_text(encoding="utf-8")
     assert ".msg-foot .budget-truncated" in css and ".chat-main > .chat-banner" in css
+
+
+def test_chat_footer_shows_reading_speed_first_letter_delay_and_latency_cap():
+    """Le pied de message affiche la latence de done.budget (prefill_tps, first_token_s, latency_capped) et la garde
+    en mémoire locale par message (rememberFooter / recallFooter) pour la réafficher au rechargement de la conversation."""
+    src = CHAT_JS.read_text(encoding="utf-8")
+    for key in ("b.prefill_tps", "b.first_token_s", "b.latency_capped"):
+        assert key in src, key
+    assert "`Lecture : ${formatNumber(Math.round(Number(b.prefill_tps)))} tokens/s`" in src
+    assert "`Première lettre : ${formatSeconds(b.first_token_s)}`" in src
+    assert "'contexte plafonné pour tenir le délai'" in src
+    # en direct comme au rechargement, le même contenu de pied ; mémorisé au done (rejeu compris), relu dans assistantMessage
+    assert "replace(foot, footContent(usage, budget, initialSources, truncated));" in src
+    assert "rememberFooter(data.message_id, { usage, budget, retained: initialSources, truncated });" in src
+    assert "const remembered = recallFooter(message.id);" in src
+    assert "const FOOTERS_KEY = 'develop.chat.footers';" in src and "const FOOTERS_MAX = 200;" in src
+    assert "window.localStorage.getItem(FOOTERS_KEY)" in src and "window.localStorage.setItem(FOOTERS_KEY, JSON.stringify(list))" in src
+
+    out = _run_harness({"profile": {"ram_total_gb": 32}})
+    latency = out["footerLatency"]
+    assert [n["class"] for n in latency] == ["budget-line", "budget-truncated", "budget-latency", "budget-latency", "budget-capped"]
+    assert [_plain(n["text"]) for n in latency] == [
+        "contexte 3 469 / 3 480 tokens — 21 sources sur 22 retenues",
+        "1 source n'a pas tenu dans le contexte : augmentez num_ctx",
+        "Lecture : 1 041 tokens/s",
+        "Première lettre : 4,1 s",
+        "contexte plafonné pour tenir le délai",
+    ]
+    assert _plain(latency[4]["title"]) == "contexte ≤ 8 000, plafonné à 3 480 tokens pour rester sous 25 s (lecture 1 041 tokens/s)"  # explication du calcul
+    assert "Vitesse de lecture du prompt" in latency[2]["title"] and "premier fragment" in latency[3]["title"]
+    # sans mesure (first_token_s null, pas de plafonnement) : seule la vitesse retenue
+    assert [_plain(t) for t in out["footerLatencyNoMeasure"]] == ["contexte 300 / 3 000 tokens — 1 source sur 1 retenue", "Lecture : 60 tokens/s"]
+    assert out["seconds"] == ["4,1 s", "0,4 s", "10 s", "192 s", "0 s", "—", "—"]
+    # mémoire locale : par identifiant de message, remplacée au second done, sans identifiant ignorée, sources écartées réduites
+    memory = out["footerMemory"]
+    assert memory["recalled"]["usage"] == {"prompt_tokens": 4712, "completion_tokens": 75} and memory["recalled"]["retained"] == 21
+    assert memory["recalled"]["budget"]["prefill_tps"] == 1041.0 and memory["recalled"]["budget"]["first_token_s"] == 4.06
+    assert memory["recalled"]["truncated"] == [] and memory["unknown"] is None and memory["none"] is None
+    assert memory["keys"] == ["/42", "/43"] and memory["truncatedKeys"] == ["path", "title", "ref"]
+    # bornée aux 200 derniers messages ; stockage indisponible : aucune erreur, le pied reste connu de la page en cours
+    assert out["footerMemoryBounded"] == {"count": 200, "first": "/200", "last": "/399", "evicted": True}
+    assert out["footerMemoryUnavailable"] is True
 
 
 def test_engine_form_binds_think_num_ctx_advice_and_tools_warning():

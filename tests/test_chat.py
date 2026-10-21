@@ -23,9 +23,9 @@ from develop.chat import (
     estimate_tokens,
     render_sources_for_model,
 )
-from develop.chat.budget import (MAX_ANSWER_RESERVE, MAX_HISTORY_TOKENS, MIN_ANSWER_RESERVE, MIN_HISTORY_TOKENS,
-                                 MIN_TOOL_BUDGET, SYSTEM_TOKENS_CAP, answer_reserve_for, history_tokens_for,
-                                 system_prompt_tokens, system_text_tokens, tool_specs_tokens)
+from develop.chat.budget import (LATENCY_CONTEXT_FLOOR, MAX_ANSWER_RESERVE, MAX_HISTORY_TOKENS, MIN_ANSWER_RESERVE,
+                                 MIN_HISTORY_TOKENS, MIN_TOOL_BUDGET, SYSTEM_TOKENS_CAP, answer_reserve_for,
+                                 history_tokens_for, system_prompt_tokens, system_text_tokens, tool_specs_tokens)
 from develop.chat.context_builder import (GRAPH_FILE_PREVIEW_LINES, IMPORTS_OMITTED_MARKER, LocalHit, _CardLoader,
                                           _fit_sections, _repo_prefix, _request_section, build_cards, format_block,
                                           format_header, render_sources_as_text)
@@ -576,9 +576,72 @@ def test_budget_to_dict_and_tolerant_inputs():
     assert isinstance(b, Budget) and b.num_ctx == 8192
     d = b.to_dict()
     assert set(d) == {"num_ctx", "system_tokens", "question_tokens", "history_tokens_max", "context_tokens_max",
-                      "tools_tokens_max", "answer_reserve", "tool_rounds_max", "tools_mode", "source"}
+                      "tools_tokens_max", "answer_reserve", "tool_rounds_max", "tools_mode", "source", "prefill_tps",
+                      "latency_capped"}
     assert d["tools_mode"] == "native" and d["question_tokens"] == 0
+    assert d["prefill_tps"] is None and d["latency_capped"] is False and b.expected_first_token_s is None
     assert compute_budget(None, None, None, tools_mode="turbo").tools_mode == "none"  # mode inconnu = sans outils
+
+
+def test_compute_budget_latency_cap_bounds_context_by_reading_speed():
+    # Régression : avec num_ctx 40 960 l'UI laissait le modèle lire 11,7k tokens de contexte à 60 tokens/s (192 s avant
+    # la première lettre). Le contexte est borné par ce que le modèle lit en first_token_target_s (25 s par défaut).
+    assert LLMConfig().first_token_target_s == 25.0
+    cfg = LLMConfig(num_ctx=32768)
+    free = compute_budget(cfg, info(32768), profile(64))  # sans vitesse : aucune borne de latence
+    assert free.prefill_tps is None and free.latency_capped is False and free.context_tokens_max > LATENCY_CONTEXT_FLOOR
+    # 60 tok/s × 25 s = 1 500 tokens lisibles, moins que les consignes seules : le plancher s'applique
+    slow = compute_budget(cfg, info(32768), profile(64), prefill_tps=60)
+    assert slow.latency_capped is True and slow.context_tokens_max == LATENCY_CONTEXT_FLOOR == 1500
+    assert slow.prefill_tps == 60 and slow.total <= slow.num_ctx
+    assert "plafonné à 1500 tokens pour rester sous 25 s (lecture estimée 60 tokens/s)" in slow.source
+    assert slow.expected_first_token_s == pytest.approx(slow.prompt_tokens_max / 60) and slow.expected_first_token_s > 25
+    # 400 tok/s × 25 s = 10 000 tokens : consignes, question et historique lus d'abord, le reste au contexte
+    mid = compute_budget(cfg, info(32768), profile(64), prefill_tps=400, question_tokens=40)
+    assert mid.latency_capped is True
+    assert mid.context_tokens_max == 10_000 - mid.system_tokens - mid.question_tokens - mid.history_tokens_max
+    assert LATENCY_CONTEXT_FLOOR < mid.context_tokens_max < free.context_tokens_max
+    assert mid.expected_first_token_s == pytest.approx(25.0)
+    # un modèle rapide n'est pas bridé (2 000 tok/s × 25 s = 50 000 tokens > contexte libre)
+    fast = compute_budget(cfg, info(32768), profile(64), prefill_tps=2000)
+    assert fast.latency_capped is False and fast.context_tokens_max == free.context_tokens_max
+    assert "plafonné" not in fast.source and fast.prefill_tps == 2000
+    # l'objectif est configurable : 80 s à 400 tok/s = 32 000 tokens, plus que le prompt entier → plus de borne
+    patient = compute_budget(LLMConfig(num_ctx=32768, first_token_target_s=80), info(32768), profile(64), prefill_tps=400)
+    assert patient.latency_capped is False and patient.first_token_target_s == 80
+    assert patient.context_tokens_max == free.context_tokens_max and patient.expected_first_token_s < 80
+    # le plancher ne relève jamais un contexte déjà plus petit (fenêtre de 2 048 : tout tient sous 1 500)
+    small = compute_budget(LLMConfig(num_ctx=2048), info(2048), None, prefill_tps=60)
+    assert small.latency_capped is False
+    assert small.context_tokens_max == compute_budget(LLMConfig(num_ctx=2048), info(2048), None).context_tokens_max < 1500
+    # la borne s'ajoute aux autres plafonds (demande de l'UI, max_context_chars) : le plus petit gagne
+    assert compute_budget(cfg, info(32768), profile(64), prefill_tps=400, override_context_tokens=900).context_tokens_max == 900
+    # vitesses inexploitables : pas de borne
+    for tps in (0, -5, "lent", float("nan")):
+        assert compute_budget(cfg, info(32768), profile(64), prefill_tps=tps).latency_capped is False  # type: ignore[arg-type]
+
+
+def test_estimate_prefill_tps_follows_generation_speed_then_model_size():
+    from develop.llm.advisor import (PREFILL_PER_GENERATION, PREFILL_TPS_MAX, PREFILL_TPS_MIN, estimate_prefill_tps,
+                                     estimate_speed, model_params_b)
+
+    # taille du modèle : parameter_size d'Ollama (« 7.6B », « 137M ») ou le nom (« qwen3:14b », « qwen3.5:9b »)
+    assert model_params_b("qwen3:14b") == 14 and model_params_b("qwen3.5:9b") == 9 and model_params_b("qwen3-embedding:0.6b") == 0.6
+    assert model_params_b(ModelInfo(name="x", parameter_size="7.6B")) == 7.6 and model_params_b({"name": "gemma3:27b"}) == 27
+    assert model_params_b(ModelInfo(name="nomic-embed-text", parameter_size="137M")) == 0.137
+    assert model_params_b("qwen3:30b-a3b") == 30 and model_params_b("mistral:latest") is None and model_params_b(None) is None
+    # machine connue : ≈ 6 × la vitesse de génération estimée, bornée [40, 2000]
+    m1max = MachineProfile(os="macos", os_version="15", arch="arm64", cpu_model="Apple M1 Max", cpu_cores_physical=10,
+                           cpu_cores_logical=10, ram_total_gb=32, ram_available_gb=20, apple_silicon=True, unified_memory=True)
+    gen = estimate_speed({"params_b": 14}, m1max)
+    assert gen and estimate_prefill_tps("qwen3:14b", m1max) == pytest.approx(PREFILL_PER_GENERATION * gen)
+    assert PREFILL_TPS_MIN < estimate_prefill_tps("qwen3.8:27b", m1max) < estimate_prefill_tps("qwen3.5:9b", m1max) < PREFILL_TPS_MAX
+    assert estimate_prefill_tps("all-minilm:33m", m1max) == PREFILL_TPS_MAX  # minuscule : plafond
+    assert estimate_prefill_tps("llama3:70b", profile(32)) == PREFILL_TPS_MIN  # CPU seul : < 40 tok/s → plancher
+    # machine inconnue : repli par taille (150 < 10B, 100 < 20B, 60 au-delà), 100 si la taille manque aussi
+    assert estimate_prefill_tps("qwen3.5:9b", None) == 150 and estimate_prefill_tps("qwen3:14b", None) == 100
+    assert estimate_prefill_tps(ModelInfo(name="big", parameter_size="27B"), None) == 60
+    assert estimate_prefill_tps("mistral:latest", None) == 100 and estimate_prefill_tps(None, None) == 100
 
 
 # =========================================================================== assembleur de contexte
@@ -2375,8 +2438,11 @@ async def test_followup_passages_bring_the_requested_section(db: Database, works
 
 
 async def test_model_phase_statuses_announce_loading_then_reading(tmp_path):
-    """Après ``sources`` : « Chargement du modèle … » si le moteur ne l'a pas en mémoire, puis « Le modèle lit … »."""
-    from develop.chat.orchestrator import ChatOrchestrator, STATUS_LOADING, STATUS_READING
+    """Après ``sources`` : « Chargement du modèle … » si le moteur ne l'a pas en mémoire, puis « Le modèle lit … ».
+    Un appel qui a dû charger le modèle n'est pas pris pour une mesure de vitesse de lecture. ``/api/ps`` vide (``[]``)
+    veut dire « rien en mémoire » : chargement annoncé, pas de mesure ; ``None`` « le moteur ne le dit pas » (serveur
+    compatible OpenAI, Ollama injoignable) : rien d'annoncé, la mesure est conservée."""
+    from develop.chat.orchestrator import ChatOrchestrator, STATUS_LOADING, STATUS_READING, _prefill_samples
 
     class _Llm(NullClient):
         engine = "ollama"
@@ -2389,14 +2455,293 @@ async def test_model_phase_statuses_announce_loading_then_reading(tmp_path):
             return self._loaded
 
         async def chat_stream(self, messages, model, **kwargs):  # type: ignore[override]
-            yield ChatChunk(text="ok", done=True)
+            yield ChatChunk(text="ok", done=True, usage={"prompt_tokens": 4000, "completion_tokens": 1})
 
     db = Database(":memory:")
     ws = WorkspaceConfig(id="w", name="w", llm=LLMConfig(engine="ollama", model="qwen3.8:27b"))
-    for loaded, expect_loading in (([], False), (["qwen3.8:27b"], False), (["autre:1b"], True)):
+    samples = 0
+    # Même règle que GET /api/llm/state : une autre taille du même modèle (qwen3.8:9b) n'est pas « chargé ».
+    for loaded, expect_loading in ((None, False), ([], True), (["qwen3.8:27b"], False), (["autre:1b"], True),
+                                   (["qwen3.8:9b"], True)):
         orch = ChatOrchestrator(db, ws, _Llm(loaded), FakeSearchEngine([]))
         conv = db.create_conversation("t")
         events = [e async for e in orch.respond(conv, "question ?", mode="no_tools")]
         statuses = [e.data.get("text", "") for e in events if e.type == "status"]
         assert any(t.startswith(STATUS_READING.split(" %d")[0]) for t in statuses)
         assert any(t == STATUS_LOADING % "qwen3.8:27b" for t in statuses) is expect_loading
+        samples += 0 if expect_loading else 1
+        assert len(_prefill_samples(db, "ollama", "qwen3.8:27b")) == samples
+
+
+async def test_prefill_measure_ignores_calls_where_the_engine_loaded_the_model():
+    """Ollama rapporte ``load_duration`` (→ ``usage.load_duration_ms``) : au-delà de ``PREFILL_LOAD_MAX_S`` l'appel a
+    (re)chargé le modèle (keep_alive expiré entre deux sondages de l'UI, autre ``num_ctx``, ``develop ask`` sans
+    préchauffage) et son délai n'est pas une vitesse de lecture, même si ``/api/ps`` le disait en mémoire juste avant.
+    ``first_token_s`` reste le délai perçu et ``done.usage`` rapporte ``load_duration_ms``."""
+    from develop.chat.orchestrator import ChatOrchestrator, PREFILL_LOAD_MAX_S, _prefill_samples
+
+    class _Llm(NullClient):
+        engine = "ollama"
+
+        def __init__(self, load_ms):
+            super().__init__()
+            self.load_ms = load_ms
+
+        async def loaded_models(self):
+            return ["qwen3:14b"]
+
+        async def chat_stream(self, messages, model, **kwargs):  # type: ignore[override]
+            yield ChatChunk(text="ok", done=True,
+                            usage={"prompt_tokens": 4000, "completion_tokens": 1, "load_duration_ms": self.load_ms})
+
+    db = Database(":memory:")
+    ws = WorkspaceConfig(id="w", name="w", llm=LLMConfig(engine="ollama", model="qwen3:14b"))
+    assert PREFILL_LOAD_MAX_S == 1.0
+    samples = 0
+    for load_ms, measured in ((12_000, False), (1_001, False), (40, True), (0, True)):
+        orch = ChatOrchestrator(db, ws, _Llm(load_ms), FakeSearchEngine([]))
+        conv = db.create_conversation("t")
+        events = [e async for e in orch.respond(conv, "question ?", mode="no_tools")]
+        done = [e for e in events if e.type == "done"][-1].data
+        assert done["usage"]["load_duration_ms"] == load_ms and done["budget"]["first_token_s"] is not None
+        samples += 1 if measured else 0
+        assert len(_prefill_samples(db, "ollama", "qwen3:14b")) == samples
+
+
+async def test_prefill_not_measured_when_first_fragment_is_a_tool_call():
+    """Ollama n'émet un appel d'outil qu'une fois son JSON entièrement généré : un premier appel qui commence par un
+    ``tool_call`` ne mesure pas la vitesse de lecture (le délai mêlerait lecture et génération : ×4 sur un 14B, la
+    moyenne glisserait vers le plancher et réduirait le contexte sans nécessité). ``first_token_s`` reste le délai perçu.
+    Un premier fragment de texte, lui, est mesuré, même s'il précède un appel d'outil dans le même tour."""
+    from develop.chat.orchestrator import ChatOrchestrator, _prefill_samples
+
+    search_call = ToolCall(name="search", arguments={"query": "orders"}, id="c1")
+    usage = {"prompt_tokens": 4000, "completion_tokens": 60}
+
+    class _Llm(NullClient):
+        engine = "ollama"
+
+        def __init__(self, first_round):
+            super().__init__()
+            self.first_round = list(first_round)
+            self.calls = 0
+
+        async def loaded_models(self):
+            return ["fake:7b"]
+
+        async def chat_stream(self, messages, model, **kwargs):  # type: ignore[override]
+            self.calls += 1
+            if self.calls > 1:  # tour suivant l'outil
+                yield ChatChunk(text="Réponse.", done=True, usage=usage)
+                return
+            await asyncio.sleep(0.02)  # lecture du prompt
+            for chunk in self.first_round:
+                if chunk.tool_calls:
+                    await asyncio.sleep(0.06)  # génération du JSON de l'appel avant son émission
+                yield chunk
+
+    db = Database(":memory:")
+    ws = WorkspaceConfig(id="w", name="w", llm=LLMConfig(engine="ollama", model="fake:7b"))
+
+    async def run(first_round, mode):
+        orch = ChatOrchestrator(db, ws, _Llm(first_round), FakeSearchEngine([]), model_info=info(32768))
+        events = [e async for e in orch.respond(db.create_conversation("t"), "Quels champs a la table orders ?", mode=mode)]
+        return [e for e in events if e.type == "done"][-1].data["budget"], types(events)
+
+    # premier fragment = appel d'outil : délai perçu rapporté, aucune mesure enregistrée
+    budget, kinds = await run([ChatChunk(tool_calls=[search_call], done=True, usage=usage)], "auto")
+    assert kinds == ["status", "sources", "status", "tool_call", "tool_result", "delta", "done"]
+    assert budget["first_token_s"] >= 0.08 and _prefill_samples(db, "ollama", "fake:7b") == []
+    # réponse texte directe : mesurée (4 000 tokens en ≈ 0,02 s → plafond 2 000 tok/s)
+    budget, kinds = await run([ChatChunk(text="Réponse.", done=True, usage=usage)], "no_tools")
+    assert kinds == ["status", "sources", "status", "delta", "done"]
+    assert budget["first_token_s"] < 0.08 and _prefill_samples(db, "ollama", "fake:7b") == [2000.0]
+    # texte puis appel d'outil dans le même tour : le premier fragment de texte date la fin de la lecture
+    budget, kinds = await run([ChatChunk(text="Je regarde. "), ChatChunk(tool_calls=[search_call], done=True, usage=usage)],
+                              "auto")
+    assert kinds == ["status", "sources", "status", "delta", "tool_call", "tool_result", "delta", "done"]
+    assert budget["first_token_s"] < 0.08 and _prefill_samples(db, "ollama", "fake:7b") == [2000.0, 2000.0]
+
+
+async def test_prefill_measure_discounts_the_prompt_prefix_cached_by_the_engine(db: Database, workspace: WorkspaceConfig, seeded):
+    """``usage.prompt_tokens`` (``prompt_eval_count`` d'Ollama) compte tout le prompt alors que le moteur ne relit que
+    ce qui n'est pas dans son cache de préfixe (préfixe commun avec ses requêtes précédentes) : le délai jusqu'au
+    premier fragment ne couvre que cette part. Une question reposée telle quelle dans une nouvelle conversation
+    (prompt identique, première lettre immédiate) ne fournit donc aucune mesure — au lieu d'un échantillon à
+    2 000 tok/s qui relâchait la borne de latence (11,7k tokens relus en 192 s au tour suivant) — et un tour ordinaire
+    (consignes et début de l'historique en cache) est mesuré sur la part réellement lue."""
+    from develop.chat.orchestrator import PREFILL_MIN_PROMPT_TOKENS, _prefill_samples
+
+    class CachedPromptLLM(LLMClient):
+        """Moteur simulé avec cache de préfixe : lit ``chars_per_s`` caractères/s de ce qui n'est pas dans le préfixe
+        commun avec l'appel précédent, rapporte ``prompt_tokens`` = tout le prompt (4 caractères/token)."""
+        engine = "fake"
+
+        def __init__(self, chars_per_s: float):
+            self.chars_per_s = chars_per_s
+            self.last = ""
+            self.calls: List[Dict[str, int]] = []
+
+        async def chat_stream(self, messages, model, **kwargs):  # type: ignore[override]
+            text = "".join("%s\n%s\n" % (m.role, m.content) for m in messages)
+            cached = 0
+            for a, b in zip(self.last, text):
+                if a != b:
+                    break
+                cached += 1
+            self.last = text
+            self.calls.append({"total": len(text), "cached": cached})
+            await asyncio.sleep((len(text) - cached) / self.chars_per_s)
+            yield ChatChunk(text="Réponse [S1]. " + "Le statut est documenté. " * 60)
+            yield ChatChunk(done=True, usage={"prompt_tokens": len(text) // 4, "completion_tokens": 5})
+
+    engine = FakeSearchEngine([file_hit(), doc_hit(), note_hit()])
+    llm = CachedPromptLLM(6000.0)  # vitesse réelle 1 500 tok/s : sous le plafond 2 000, une mesure gonflée se verrait
+    orch = make_orchestrator(db, workspace, llm, engine, model_info=info(32768, tools=True))
+    question = "Quels champs a la table orders ?"
+    # (1) première question : rien en cache, le prompt entier est lu → mesure ≈ 1 500 tok/s
+    first = db.create_conversation()
+    d1 = (await collect(orch, first, question, mode="no_tools"))[-1].data["budget"]
+    assert llm.calls[-1]["cached"] == 0 and llm.calls[-1]["total"] // 4 >= PREFILL_MIN_PROMPT_TOKENS
+    assert d1["first_token_s"] >= 0.3 and 1100 <= d1["prefill_tps"] <= 1700
+    assert _prefill_samples(db, "fake", "fake:7b") == [d1["prefill_tps"]]
+    # (2) la même question dans une nouvelle conversation : prompt identique, entièrement en cache, première lettre
+    #     immédiate → aucune mesure (le compte total ÷ délai aurait valu le plafond 2 000 tok/s)
+    second = db.create_conversation()
+    d2 = (await collect(orch, second, question, mode="no_tools"))[-1].data["budget"]
+    assert llm.calls[-1]["cached"] == llm.calls[-1]["total"] and d2["first_token_s"] < 0.1
+    assert _prefill_samples(db, "fake", "fake:7b") == [d1["prefill_tps"]] and d2["prefill_tps"] == d1["prefill_tps"]
+    # (3) une autre question dans cette conversation : consignes et début de l'historique en cache (≈ la moitié du
+    #     prompt), mesure sur la part relue → toujours ≈ 1 500 tok/s, et non 2 000
+    d3 = (await collect(orch, second, "Quelles routes manipulent la table orders ?", mode="no_tools"))[-1].data["budget"]
+    call = llm.calls[-1]
+    assert 0.3 < call["cached"] / call["total"] < 0.7 and (call["total"] - call["cached"]) // 4 >= PREFILL_MIN_PROMPT_TOKENS
+    samples = _prefill_samples(db, "fake", "fake:7b")
+    assert len(samples) == 2 and abs(samples[1] - samples[0]) <= 0.25 * samples[0] and samples[1] < 1800
+    assert d3["prefill_tps"] == min(samples)  # médiane basse des deux mesures
+    # (4) la part en cache retirée du compte : trop peu de tokens relus → pas de mesure ; sinon mesure sur le reste
+    assert orch._cached_fraction("autre:1b", "x") == 0.0 and orch._cached_fraction("fake:7b", "") == 0.0
+    assert orch._record_prefill(4000, 1.0, cached_fraction=0.95) is None  # 200 tokens relus < 256
+    assert orch._record_prefill(4000, 1.0, cached_fraction=0.5) == sorted(samples)[1]  # 2 000 tok/s : médiane basse
+    assert _prefill_samples(db, "fake", "fake:7b") == samples + [2000.0]
+
+
+def test_prefill_tps_median_is_persisted_per_model():
+    from develop.chat.orchestrator import (PREFILL_META_KEY, PREFILL_META_VERSION, PREFILL_SAMPLES, load_prefill_tps,
+                                           record_prefill_tps)
+
+    with Database(":memory:") as mem:
+        assert load_prefill_tps(mem, "ollama", "qwen3:14b") is None
+        retained = None
+        for tps in (300, 50, 60, 70, 80, 90, 100):  # sept mesures : seules les cinq dernières comptent
+            retained = record_prefill_tps(mem, "ollama", "qwen3:14b", tps)
+        assert retained == 80.0 == load_prefill_tps(mem, "ollama", "qwen3:14b")
+        stored = json.loads(mem.get_meta(PREFILL_META_KEY % "qwen3:14b"))
+        assert stored["engine"] == "ollama" and stored["samples"] == [60, 70, 80, 90, 100] and stored["avg"] == 80
+        assert stored["v"] == PREFILL_META_VERSION == 2 and stored["median"] == 80
+        assert len(stored["samples"]) == PREFILL_SAMPLES and stored["updated_at"] > 0
+        # la valeur retenue est la médiane basse : deux mesures gonflées (prompt en cache non détecté : cache d'un
+        # autre slot, redémarrage de l'outil) ne la déplacent pas, la moyenne aurait relâché la borne de latence
+        assert record_prefill_tps(mem, "ollama", "qwen3:14b", 2000) == 90.0  # [70, 80, 90, 100, 2000]
+        assert record_prefill_tps(mem, "ollama", "qwen3:14b", 2000) == 100.0  # [80, 90, 100, 2000, 2000]
+        assert json.loads(mem.get_meta(PREFILL_META_KEY % "qwen3:14b"))["avg"] == 854  # la moyenne, elle, aurait cédé
+        # nombre pair : la plus petite des deux centrales (surestimer coûte des minutes, sous-estimer des sources)
+        assert record_prefill_tps(mem, "ollama", "pair:7b", 60) == 60.0 and record_prefill_tps(mem, "ollama", "pair:7b", 2000) == 60.0
+        # les mesures d'avant la correction (sans version : prompt entier compté, cache compris) sont ignorées puis remplacées
+        mem.set_meta(PREFILL_META_KEY % "ancien:14b", json.dumps({"engine": "ollama", "samples": [2000, 2000, 60], "avg": 1353}))
+        assert load_prefill_tps(mem, "ollama", "ancien:14b") is None
+        assert record_prefill_tps(mem, "ollama", "ancien:14b", 60) == 60.0
+        assert json.loads(mem.get_meta(PREFILL_META_KEY % "ancien:14b"))["samples"] == [60]
+        # bornes [40, 2000] ; un autre modèle n'a rien ; le même nom sur un autre moteur n'est pas comparable
+        assert record_prefill_tps(mem, "ollama", "petit:1b", 1_000_000) == 2000.0
+        assert record_prefill_tps(mem, "ollama", "lent:70b", 3) == 40.0
+        assert load_prefill_tps(mem, "ollama", "autre:7b") is None and load_prefill_tps(mem, "openai_compat", "qwen3:14b") is None
+        # un autre moteur qui mesure repart de zéro ; mesures invalides refusées ; méta corrompue tolérée
+        assert record_prefill_tps(mem, "openai_compat", "qwen3:14b", 500) == 500.0
+        assert record_prefill_tps(mem, "openai_compat", "qwen3:14b", 0) is None
+        assert record_prefill_tps(mem, "openai_compat", "", 50) is None and record_prefill_tps(None, "ollama", "x", 50) is None
+        mem.set_meta(PREFILL_META_KEY % "qwen3:14b", "{pas du json")
+        assert load_prefill_tps(mem, "openai_compat", "qwen3:14b") is None
+
+
+async def test_measured_reading_speed_is_reported_and_bounds_the_next_budget(db: Database, workspace: WorkspaceConfig, seeded):
+    import re as _re
+
+    from develop.chat.orchestrator import PREFILL_META_KEY, load_prefill_tps, record_prefill_tps
+
+    engine = FakeSearchEngine([file_hit(), doc_hit(), note_hit()])
+    reading = _re.compile(r"Le modèle lit (\d+) sources \(≈ (\d+) tokens, ~(\d+) s estimées\) avant de répondre…")
+    # (1) aucune mesure : estimation (fake:7b sur une machine sans GPU → plancher 40 tok/s) ; le contexte est plafonné
+    #     au plancher (40 × 25 s = 1 000 tokens < consignes) et le délai annoncé compte le prompt entier à cette vitesse
+    llm = FakeLLM([text_chunks("Réponse [S1].", usage={"prompt_tokens": 4000, "completion_tokens": 5})], delay=0.02)
+    orch = make_orchestrator(db, workspace, llm, engine, model_info=info(32768, tools=True))
+    assert orch.prefill_tps() == (40.0, False)
+    conv = db.create_conversation()
+    events = [e async for e in orch.respond(conv, "Quels champs a la table orders ?", mode="no_tools")]
+    status = [e.data["text"] for e in events if e.type == "status"][-1]
+    m = reading.fullmatch(status)
+    assert m, status
+    n_sources, context_tokens, seconds = (int(g) for g in m.groups())
+    done = events[-1].data["budget"]
+    assert n_sources == len(events[1].data["items"]) and context_tokens == done["context_tokens_used"]
+    assert seconds >= (context_tokens + estimate_tokens(llm.calls[0]["messages"][0].content)) / 40
+    assert done["latency_capped"] is True and done["max_context_tokens"] == 1500
+    assert "plafonné à 1500 tokens pour rester sous 25 s (lecture estimée 40 tokens/s)" in done["source"]
+    # le premier appel est chronométré : 4 000 tokens de prompt en ≈ 20 ms → borné à 2 000 tok/s, moyenne persistée
+    assert done["first_token_s"] >= 0.02 and done["prefill_tps"] == 2000.0 == load_prefill_tps(db, "fake", "fake:7b")
+    # (2) la moyenne mesurée remplace l'estimation : à 2 000 tok/s le contexte n'est plus bridé ; un prompt court
+    #     (100 tokens) ne fournit pas de mesure
+    llm2 = FakeLLM([text_chunks("Réponse [S1].")])
+    orch2 = make_orchestrator(db, workspace, llm2, engine, model_info=info(32768, tools=True))
+    assert orch2.prefill_tps() == (2000.0, True)
+    done2 = (await collect(orch2, conv, "Quelles routes manipulent la table orders ?", mode="no_tools"))[-1].data["budget"]
+    assert done2["latency_capped"] is False and done2["max_context_tokens"] > 1500 and done2["prefill_tps"] == 2000.0
+    assert done2["first_token_s"] is not None and load_prefill_tps(db, "fake", "fake:7b") == 2000.0
+    # (3) un modèle mesuré lent (60 tok/s) : plancher, explication et délai annoncé ≈ prompt ÷ 60
+    db.set_meta(PREFILL_META_KEY % "fake:7b", None)
+    record_prefill_tps(db, "fake", "fake:7b", 60)
+    orch3 = make_orchestrator(db, workspace, FakeLLM([text_chunks("Réponse [S1].")]), engine, model_info=info(32768, tools=True))
+    events3 = [e async for e in orch3.respond(conv, "Quels champs a la table orders ?", mode="no_tools")]
+    m3 = reading.fullmatch([e.data["text"] for e in events3 if e.type == "status"][-1])
+    assert m3 and int(m3.group(3)) >= int(m3.group(2)) / 60
+    done3 = events3[-1].data["budget"]
+    assert done3["max_context_tokens"] == 1500 and done3["latency_capped"] is True and done3["prefill_tps"] == 60.0
+    assert "lecture estimée 60 tokens/s" in done3["source"]
+    # recherche seule : aucun appel, donc aucun délai mesuré, mais la borne du budget est rapportée
+    done_s = (await collect(orch3, conv, "Question", mode="search_only"))[-1].data["budget"]
+    assert done_s["first_token_s"] is None and done_s["prefill_tps"] == 60.0 and done_s["latency_capped"] is True
+
+
+
+async def test_nothink_is_always_sent_to_ollama_even_without_model_info():
+    """« /set nothink » : think=False part vers Ollama même quand les capacités du modèle sont inconnues ;
+    think=True n'est envoyé que si le modèle supporte la réflexion."""
+    from develop.chat.orchestrator import ChatOrchestrator
+
+    class _Llm(NullClient):
+        engine = "ollama"
+
+        def __init__(self):
+            super().__init__()
+            self.kwargs = []
+
+        async def chat_stream(self, messages, model, **kwargs):  # type: ignore[override]
+            self.kwargs.append(kwargs)
+            yield ChatChunk(text="ok", done=True)
+
+    db = Database(":memory:")
+    for think, info, expected in ((False, None, False), (True, None, "absent"),
+                                  (True, info_with_caps(["completion", "thinking"]), True),
+                                  (False, info_with_caps(["completion"]), False)):
+        ws = WorkspaceConfig(id="w", name="w", llm=LLMConfig(engine="ollama", model="qwen3:14b", think=think))
+        llm = _Llm()
+        orch = ChatOrchestrator(db, ws, llm, FakeSearchEngine([]), model_info=info)
+        conv = db.create_conversation("t")
+        async for _ in orch.respond(conv, "question ?", mode="no_tools"):
+            pass
+        sent = llm.kwargs[0].get("think", "absent")
+        assert sent == expected, (think, info, sent)
+
+
+def info_with_caps(caps):
+    return ModelInfo(name="qwen3:14b", context_length=40960, capabilities=list(caps))

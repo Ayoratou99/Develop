@@ -502,6 +502,60 @@ def estimate_speed(model: Dict[str, Any], profile: Any, mode: Optional[str] = No
         return None
 
 
+# --------------------------------------------------------------------------- préremplissage (lecture du prompt)
+
+PREFILL_PER_GENERATION = 6.0  # lecture du prompt ≈ 6 × la vitesse de génération (calcul par lots, même bande passante)
+PREFILL_TPS_MIN = 40.0  # bornes de l'estimation (et des mesures du chat) en tokens/s
+PREFILL_TPS_MAX = 2000.0
+# repli quand la bande passante de la machine est inconnue : (taille exclusive en milliards de paramètres, tokens/s)
+PREFILL_TPS_BY_SIZE = ((10.0, 150.0), (20.0, 100.0))
+PREFILL_TPS_LARGE = 60.0  # ≥ 20B
+PREFILL_TPS_UNKNOWN = 100.0  # taille inconnue aussi
+_PARAMS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*([bm])\b", re.IGNORECASE)
+
+
+def model_params_b(model: Any) -> Optional[float]:
+    """Milliards de paramètres d'un modèle, ou ``None``.
+
+    ``model`` est un nom de modèle (« qwen3:14b », « qwen3-embedding:0.6b »), un :class:`~develop.llm.base.ModelInfo`
+    ou un dict (``parameter_size`` « 7.6B » / « 137M » d'Ollama en premier, sinon le nom). Le premier nombre suivi de
+    B ou M est retenu (« qwen3:30b-a3b » → 30).
+    """
+    if model is None:
+        return None
+    texts = [model] if isinstance(model, str) else [_pget(model, "parameter_size", ""), _pget(model, "name", "")]
+    for text in texts:
+        m = _PARAMS_RE.search(str(text or ""))
+        if m is None:
+            continue
+        value = float(m.group(1).replace(",", "."))
+        if m.group(2).lower() == "m":
+            value /= 1000.0
+        if value > 0:
+            return value
+    return None
+
+
+def estimate_prefill_tps(model: Any, profile: Any) -> float:
+    """Vitesse de préremplissage estimée (tokens/s lus par le modèle), toujours un nombre > 0.
+
+    ≈ :data:`PREFILL_PER_GENERATION` × :func:`estimate_speed` (bande passante de la machine ÷ taille du modèle),
+    bornée entre :data:`PREFILL_TPS_MIN` et :data:`PREFILL_TPS_MAX`. Sans bande passante connue : 150 tok/s pour un
+    modèle < 10B, 100 pour 10–19B, 60 à partir de 20B ; 100 si la taille est inconnue aussi. ``model`` est un nom,
+    un ``ModelInfo`` ou un dict (voir :func:`model_params_b`). Le chat remplace cette estimation par ses mesures.
+    """
+    params = model_params_b(model)
+    speed = estimate_speed({"params_b": params}, profile) if params else None
+    if speed:
+        return float(min(PREFILL_TPS_MAX, max(PREFILL_TPS_MIN, PREFILL_PER_GENERATION * speed)))
+    if params is None:
+        return PREFILL_TPS_UNKNOWN
+    for limit, tps in PREFILL_TPS_BY_SIZE:
+        if params < limit:
+            return tps
+    return PREFILL_TPS_LARGE
+
+
 # --------------------------------------------------------------------------- évaluation d'un modèle
 
 def _license_warning(license_text: str) -> str:

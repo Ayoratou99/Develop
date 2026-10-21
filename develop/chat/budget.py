@@ -29,6 +29,15 @@ place à au moins un résultat d'outil, les outils sont désactivés (``tools_mo
 leur part revient au contexte. Les consignes système sont mesurées sur les vrais gabarits de
 :mod:`develop.chat.prompts` (ou fournies, déjà mesurées, par l'orchestrateur), jamais devinées.
 
+Borne de latence : la fenêtre n'est pas le seul plafond, le temps de lecture l'est aussi. Le
+modèle lit le prompt à ``prefill_tps`` tokens/s (mesurés par l'orchestrateur, sinon estimés par
+:func:`develop.llm.advisor.estimate_prefill_tps`) et la première lettre de la réponse doit
+arriver en ``cfg.first_token_target_s`` (25 s par défaut) : le contexte récupéré ne dépasse jamais
+``prefill_tps × first_token_target_s − consignes − question − historique``, avec un plancher de
+:data:`LATENCY_CONTEXT_FLOOR` tokens (en dessous, la qualité prime sur le délai) et pour plafond
+le contexte calculé ci-dessus. Sans ``prefill_tps``, ou avec ``first_token_target_s`` à 0 (objectif
+désactivé), aucune borne de latence.
+
 Tout est estimé en tokens ≈ caractères / 4 (code ≈ caractères / 3,5), sans tokenizer.
 """
 from __future__ import annotations
@@ -55,6 +64,8 @@ SYSTEM_MARGIN_SHARE = 0.10  # marge de l'estimation des consignes (nom du projet
 SYSTEM_TOKENS_CAP = 1500  # plafond des consignes textuelles estimées (hors définitions d'outils natifs)
 TOOL_SPEC_OVERHEAD_TOKENS = 4  # cadre ajouté par le gabarit du moteur autour de chaque définition d'outil
 TOOLS_MODES = ("native", "text", "none")
+DEFAULT_FIRST_TOKEN_TARGET_S = 25.0  # même défaut que LLMConfig.first_token_target_s (cfg absente ou ancienne)
+LATENCY_CONTEXT_FLOOR = 1500  # la borne de latence ne descend jamais le contexte sous 1 500 tokens
 
 # Part du « reste » (après système, question, historique et réserve de réponse) consacrée au
 # contexte récupéré, selon le type de question. Le solde sert aux résultats d'outils.
@@ -141,7 +152,9 @@ class Budget:
     """Répartition (en tokens) de la fenêtre de contexte pour une question.
 
     ``system_tokens`` comprend les définitions d'outils natifs quand ``tools_mode == "native"`` ;
-    ``tools_tokens_max`` est la part réservée aux résultats d'outils (0 sans outils).
+    ``tools_tokens_max`` est la part réservée aux résultats d'outils (0 sans outils) ; ``prefill_tps`` la
+    vitesse de lecture (tokens/s) retenue pour la borne de latence (``None`` : pas de borne) et
+    ``latency_capped`` dit si cette borne a réduit le contexte.
     """
 
     num_ctx: int
@@ -154,12 +167,25 @@ class Budget:
     tools_mode: str = "native"  # mode d'outils effectif : native, text ou none
     question_tokens: int = 0
     tools_tokens_max: int = 0
+    prefill_tps: Optional[float] = None
+    latency_capped: bool = False
+    first_token_target_s: float = DEFAULT_FIRST_TOKEN_TARGET_S
 
     @property
     def total(self) -> int:
         """Somme des parts : toujours ≤ ``num_ctx``."""
         return (self.system_tokens + self.question_tokens + self.history_tokens_max + self.context_tokens_max
                 + self.tools_tokens_max + self.answer_reserve)
+
+    @property
+    def prompt_tokens_max(self) -> int:
+        """Ce que le modèle lit avant la première lettre : consignes, question, historique et contexte (plafonds)."""
+        return self.system_tokens + self.question_tokens + self.history_tokens_max + self.context_tokens_max
+
+    @property
+    def expected_first_token_s(self) -> Optional[float]:
+        """Délai estimé (s) avant la première lettre = :attr:`prompt_tokens_max` ÷ ``prefill_tps`` ; ``None`` sans vitesse."""
+        return read_time_s(self.prompt_tokens_max, self.prefill_tps)
 
     def to_dict(self) -> dict:
         return {
@@ -173,7 +199,20 @@ class Budget:
             "tool_rounds_max": self.tool_rounds_max,
             "tools_mode": self.tools_mode,
             "source": self.source,
+            "prefill_tps": self.prefill_tps,
+            "latency_capped": self.latency_capped,
         }
+
+
+def read_time_s(tokens: int, prefill_tps: Optional[float]) -> Optional[float]:
+    """Secondes nécessaires pour lire ``tokens`` à ``prefill_tps`` tokens/s (``None`` sans vitesse valable)."""
+    try:
+        tps = float(prefill_tps) if prefill_tps is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if tps <= 0:
+        return None
+    return max(0, int(tokens or 0)) / tps
 
 
 def ram_cap(ram_total_gb: Optional[float]) -> Optional[int]:
@@ -211,6 +250,25 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        f = float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def latency_context_cap(prefill_tps: Optional[float], target_s: float, system: int, question: int,
+                        history: int) -> Optional[int]:
+    """Tokens de contexte lisibles en ``target_s`` secondes à ``prefill_tps`` tokens/s une fois consignes, question
+    et historique lus, jamais moins que :data:`LATENCY_CONTEXT_FLOOR` ; ``None`` sans vitesse ni objectif valables."""
+    tps = _as_float(prefill_tps)
+    target = _as_float(target_s)
+    if tps <= 0 or target <= 0:
+        return None
+    return max(LATENCY_CONTEXT_FLOOR, int(tps * target) - system - question - history)
 
 
 def effective_num_ctx(cfg: Any, model_info: Any = None, profile: Any = None) -> Tuple[int, List[str]]:
@@ -273,12 +331,14 @@ def _split(num_ctx: int, system: int, question: int, answer: int, history_defaul
 
 def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent: str = "factual",
                    override_context_tokens: Optional[int] = None, tools_mode: str = "native",
-                   system_tokens: Optional[int] = None, question_tokens: int = 0) -> Budget:
+                   system_tokens: Optional[int] = None, question_tokens: int = 0,
+                   prefill_tps: Optional[float] = None) -> Budget:
     """Calcule le budget pour une question.
 
-    ``cfg`` est un :class:`develop.config.LLMConfig` (``num_ctx``, ``max_context_chars``),
-    ``model_info`` un :class:`develop.llm.base.ModelInfo` (``context_length``) ou ``None``,
-    ``profile`` un :class:`develop.system.profile.MachineProfile` ou ``None``.
+    ``cfg`` est un :class:`develop.config.LLMConfig` (``num_ctx``, ``max_context_chars``,
+    ``first_token_target_s``), ``model_info`` un :class:`develop.llm.base.ModelInfo`
+    (``context_length``) ou ``None``, ``profile`` un :class:`develop.system.profile.MachineProfile`
+    ou ``None``.
 
     ``tools_mode`` est le mode d'outils souhaité (``native``, ``text`` ou ``none``) ;
     ``system_tokens`` le coût mesuré des consignes système dans ce mode (définitions d'outils
@@ -288,12 +348,21 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
     revient en mode ``none`` (``tool_rounds_max = 0``) et le dit dans ``source`` ; un
     ``system_tokens`` fourni pour un mode avec outils est alors remplacé par l'estimation sans
     outils (l'appelant remesure s'il veut l'exactitude).
+
+    ``prefill_tps`` est la vitesse de lecture du modèle (tokens/s, mesurée ou estimée) : le contexte
+    est alors borné pour que le prompt entier soit lu en ``cfg.first_token_target_s`` secondes
+    (:func:`latency_context_cap`, plancher :data:`LATENCY_CONTEXT_FLOOR`) ; ``source`` l'explique
+    (« plafonné à 3200 tokens pour rester sous 25 s (lecture estimée 60 tokens/s) ») et
+    ``Budget.latency_capped`` le signale. ``None`` : pas de borne de latence.
     """
     num_ctx, parts = effective_num_ctx(cfg, model_info, profile)
     rounds = DEFAULT_TOOL_ROUNDS
     mode = tools_mode if tools_mode in TOOLS_MODES else "none"
     question = max(0, _as_int(question_tokens))
     share = intent_share(intent)
+    target_s = _as_float(getattr(cfg, "first_token_target_s", None), DEFAULT_FIRST_TOKEN_TARGET_S)
+    tps = _as_float(prefill_tps)
+    tps = tps if tps > 0 else None
 
     # ----- parts fixes -----
     answer_reserve = answer_reserve_for(num_ctx)
@@ -337,6 +406,13 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
             if override < context:
                 context = override
                 context_desc += ", borné par la demande (%d)" % override
+    latency_capped = False
+    latency_cap = latency_context_cap(tps, target_s, system, question, history)
+    if latency_cap is not None and latency_cap < context:
+        context = latency_cap
+        latency_capped = True
+        context_desc += (", plafonné à %d tokens pour rester sous %g s (lecture estimée %d tokens/s)"
+                         % (context, target_s, int(round(tps or 0))))
 
     if num_ctx - system - question - answer_reserve < 0:
         parts.append("question trop longue pour la fenêtre : le moteur tronquera")
@@ -351,4 +427,5 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
         source += " ; " + downgraded
     return Budget(num_ctx=num_ctx, system_tokens=system, history_tokens_max=history, context_tokens_max=context,
                   answer_reserve=answer_reserve, tool_rounds_max=rounds, source=source, tools_mode=mode,
-                  question_tokens=question, tools_tokens_max=tools)
+                  question_tokens=question, tools_tokens_max=tools, prefill_tps=tps, latency_capped=latency_capped,
+                  first_token_target_s=target_s)

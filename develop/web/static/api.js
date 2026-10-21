@@ -2,7 +2,8 @@
 //
 // Deux manières de recevoir des événements serveur :
 //  - streamPost() : POST + lecture du corps `text/event-stream` via ReadableStream
-//    (utilisé par le chat, qui envoie un message et reçoit la réponse en flux) ;
+//    (utilisé par streams.js, le magasin des réponses du chat : le flux survit aux changements
+//    de vue, seul l'AbortSignal du bouton « Arrêter » l'interrompt) ;
 //  - subscribe()  : EventSource classique sur une route GET (progression d'indexation).
 //
 // Toutes les erreurs HTTP sont converties en ApiError {code, message, status} à partir
@@ -212,6 +213,80 @@ export function subscribe(path, handlers = {}) {
     if (handlers.onError) handlers.onError();
   };
   return () => source.close();
+}
+
+/**
+ * Suit le chargement du modèle : SSE `/api/llm/events` (un événement `state` par seconde, puis un dernier
+ * avec `loading:false` et fin du flux), repli sur un sondage de `/api/llm/state` toutes les secondes si le
+ * flux échoue. `onState(state)` à chaque état, `onDone(state)` au plus une fois quand le chargement est fini
+ * (state peut être null si la relecture finale échoue). Renvoie stop().
+ */
+export function watchLlm({ onState, onDone, onError } = {}) {
+  let stopped = false;
+  let finished = false;
+  let closeSource = null;
+  let timer = null;
+  let last = null;
+
+  const stop = () => {
+    stopped = true;
+    if (closeSource) closeSource();
+    closeSource = null;
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  const finish = async (state) => {
+    if (finished) return;
+    finished = true;
+    stop(); // fermeture AVANT la relecture : la fin du flux ne doit pas déclencher onerror → sondage → second onDone
+    if (!state) {
+      try {
+        state = await api.get('/api/llm/state');
+        if (onState) onState(state);
+      } catch (e) {
+        if (onError) onError(e);
+      }
+    }
+    if (onDone) onDone(state || null);
+  };
+
+  const poll = async () => {
+    if (stopped) return;
+    try {
+      const state = await api.get('/api/llm/state');
+      if (stopped) return;
+      last = state;
+      if (onState) onState(state);
+      if (!state.loading) { finish(state); return; }
+    } catch (e) {
+      if (onError) onError(e);
+    }
+    if (!stopped) timer = setTimeout(poll, 1000);
+  };
+
+  try {
+    closeSource = subscribe('/api/llm/events', {
+      state: (data) => {
+        if (stopped) return;
+        last = data;
+        if (onState) onState(data);
+        if (data && data.loading === false) finish(data);
+      },
+      onError: () => {
+        // Flux fermé par le serveur après le dernier état : terminé ; sinon (route absente, serveur
+        // injoignable) repli sur le sondage.
+        if (stopped) return;
+        if (last && last.loading === false) { finish(last); return; }
+        if (closeSource) closeSource();
+        closeSource = null;
+        poll();
+      },
+    });
+  } catch (_) {
+    poll();
+  }
+  return stop;
 }
 
 /**

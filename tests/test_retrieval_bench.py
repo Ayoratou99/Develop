@@ -132,6 +132,8 @@ def bench(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]
         RepoConfig(id="database", name="database", path=str(project / "database"), kind="database"),
     ]))
     assert load_workspace("boutique") is not None
+    # sans profil machine, pas d'objectif de latence non plus (0 = désactivé) : le banc mesure la répartition par fenêtre
+    ws.llm.first_token_target_s = 0.0
     db = Database(home / "workspaces" / "boutique" / "memory.sqlite3")
     try:
         run = Indexer(db, ws).run()  # sans moteur : aucun embedding, comme chez un utilisateur sans modèle d'embeddings

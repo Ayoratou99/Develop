@@ -344,6 +344,16 @@ a.cite:hover { text-decoration: none; filter: brightness(.95); }
 .source-path { font-family: var(--mono); font-size: 12px; }
 .source-reason { color: var(--fg-muted); }
 .source.target { outline: 2px solid var(--accent); }
+/* Bandeau « Modèle qwen3:14b » (chargé / en cours de chargement / non chargé), au-dessus du fil, façon LM Studio. */
+.chat-main > .chat-model-host { flex: none; margin: 10px auto 0; width: min(860px, calc(100% - 48px)); }
+.chat-model-host:empty { display: none; }
+.chat-model { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); font-size: 13px; }
+.chat-model-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chat-model-name { font-weight: 600; }
+.chat-model-line .grow { flex: 1 1 auto; }
+.chat-model .progress { width: 100%; }
+.chat-model-error { color: var(--danger); font-size: 12.5px; }
+.compose-input:disabled { opacity: .55; cursor: not-allowed; background: var(--bg-muted); }
 .chat-compose { border-top: 1px solid var(--border); padding: 12px 24px 14px; background: var(--bg-elev); }
 .compose-box { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
 .compose-input { min-height: 54px; max-height: 220px; resize: none; }
@@ -410,11 +420,20 @@ a.cite:hover { text-decoration: none; filter: brightness(.95); }
 @media (max-width: 1000px) {
   .notes-layout { grid-template-columns: 1fr; }
 }
+/* Écrans étroits (ex. volet navigateur de 894 px) : barre latérale réduite aux icônes. La pastille
+   « Réponse en cours » (span.badge de l'entrée Chat, app.js) reste visible, sous forme de point qui
+   pulse sur l'icône — c'est le chemin vers la conversation qui répond quand on a quitté le chat — et
+   la liste des conversations reste affichée, plus étroite (jamais masquée : on doit pouvoir rouvrir
+   une conversation, en cours ou non). */
 @media (max-width: 900px) {
   :root { --sidebar-w: 64px; }
-  .brand-name, .nav-item span, .status-panel { display: none; }
-  .nav-item { justify-content: center; }
-  .chat { grid-template-columns: 1fr; }
-  .chat-side { display: none; }
+  .brand-name, .nav-item > span:not(.badge), .status-panel { display: none; }
+  .nav-item { justify-content: center; position: relative; }
+  .nav-item .badge {
+    position: absolute; top: 4px; right: 4px; width: 10px; height: 10px; padding: 0; overflow: hidden;
+    border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px var(--bg-elev); font-size: 0;
+    animation: pulse 1.2s infinite ease-in-out;
+  }
+  .chat { grid-template-columns: 190px minmax(0, 1fr); }
   .split, .notes-layout, .editor-split { grid-template-columns: 1fr; }
 }
