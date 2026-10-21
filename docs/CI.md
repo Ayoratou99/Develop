@@ -9,7 +9,7 @@ précédente.
 
 | Job | Où | Quoi |
 |---|---|---|
-| `tests (os, python)` | ubuntu-latest, macos-latest, windows-latest × Python 3.9 et 3.12 (six combinaisons, aucune n'arrête les autres) | `pip install -e ".[dev]"` puis `pytest tests -o addopts='' -q --durations=10`, avec `PYTHONUTF8=1` et `DEVELOP_HOME` dans le dossier temporaire du runner (rien n'est écrit dans `~/.develop`). Sous Windows, l'étape tourne dans `pwsh`. Node 24 est installé pour les harness web (`tests/web_harness/*.mjs`, qui exigent Node ≥ 22.15 : sans lui, les tests `test_web_*` seraient ignorés). |
+| `tests (os, python)` | ubuntu-latest, macos-latest, windows-latest × Python 3.9 et 3.12 (six combinaisons, aucune n'arrête les autres) | `pip install -e ".[dev]"` puis `pytest tests -o addopts='' -q -rs --durations=10` (`-rs` : les tests ignorés et leur raison sont listés), avec `PYTHONUTF8=1` et `DEVELOP_HOME` dans le dossier temporaire du runner (rien n'est écrit dans `~/.develop`). Sous Windows, l'étape tourne dans `pwsh`. Node 24 est installé pour les harness web (`tests/web_harness/*.mjs`, qui exigent Node ≥ 22.15 : sans lui, les tests `test_web_*` seraient ignorés). |
 | `install-scripts (ubuntu-latest)` et `(macos-latest)` | Linux, macOS | `sh install.sh` avec `HOME` redirigé vers un dossier temporaire, puis `~/.local/bin/develop --version`, `develop doctor --json`, `develop status --json`, et enfin `develop serve --port 8765 --no-browser` en arrière-plan jusqu'à ce que `GET http://127.0.0.1:8765/api/status` réponde 200 (30 s au plus), puis arrêt du serveur. |
 | `install-scripts (windows-latest)` | Windows | `powershell -ExecutionPolicy Bypass -File install.ps1` sous **Windows PowerShell 5.1** (celui de tous les Windows 10/11), avec `DEVELOP_HOME` redirigé vers un dossier temporaire ; puis `develop.cmd --version`, `develop doctor --json`, `develop status --json`, `develop --version` depuis le PATH, et `python -m develop serve --port 8765 --no-browser` en arrière-plan avec `Invoke-WebRequest` sur `/api/status` (30 s au plus), puis arrêt du processus. |
 | `report-failure` | ubuntu-latest | Si un job ci-dessus échoue : crée ou met à jour l'issue **« CI : échec »** (voir ci-dessous). |
@@ -49,12 +49,12 @@ Correspondance entre un job et son artefact : `tests (ubuntu-latest, 3.9)` → `
 Tests (depuis le dépôt, environnement de développement : `pip install -e ".[dev]"`) :
 
 ```bash
-PYTHONUTF8=1 DEVELOP_HOME="$(mktemp -d)" python -m pytest tests -o addopts='' -q --durations=10
+PYTHONUTF8=1 DEVELOP_HOME="$(mktemp -d)" python -m pytest tests -o addopts='' -q -rs --durations=10
 ```
 
 ```powershell
 $env:PYTHONUTF8 = "1"; $env:DEVELOP_HOME = Join-Path $env:TEMP "develop-home"
-python -m pytest tests -o addopts='' -q --durations=10
+python -m pytest tests -o addopts='' -q -rs --durations=10
 ```
 
 Les tests `test_web_*` demandent Node ≥ 22.15 dans le PATH (sinon ils sont ignorés) ; `test_install_scripts.py`

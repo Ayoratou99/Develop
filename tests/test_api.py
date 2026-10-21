@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from develop.api.app import CONTENT_SECURITY_POLICY
 from develop.api.sse import PING, event_stream, format_event
 from develop.git_tools import git_available
+from develop.system.profile import MachineProfile
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_project"
 INDEX_TIMEOUT_S = 60.0
@@ -97,6 +98,14 @@ def stream_events(client: TestClient, url: str, body: Dict[str, Any]) -> List[Tu
     return parse_sse(text)
 
 
+def _profile() -> MachineProfile:
+    """Profil machine fixé : la CI tourne sur des runners à 7 Go de RAM (macos-latest), où le plafond RAM de
+    ``num_ctx`` laisserait moins de MIN_TOOL_BUDGET tokens aux outils, qui seraient alors désactivés."""
+    return MachineProfile(os="macos", os_version="15", arch="arm64", cpu_model="test", cpu_cores_physical=8,
+                          cpu_cores_logical=8, ram_total_gb=32.0, ram_available_gb=16.0, apple_silicon=True,
+                          unified_memory=True)
+
+
 # --------------------------------------------------------------------------- fixture partagée
 
 @pytest.fixture(scope="module")
@@ -109,6 +118,7 @@ def env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
     from develop.api import create_app
 
     app = create_app(llm_transport=httpx.MockTransport(fake_ollama))
+    app.state.app_state._profile = _profile()  # jamais detect_machine() : budgets indépendants de la machine
     with TestClient(app) as client:
         yield SimpleNamespace(client=client, app=app, home=home, project=project, state=app.state.app_state, ids={})
     if previous is None:

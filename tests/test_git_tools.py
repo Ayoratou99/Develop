@@ -20,16 +20,23 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=dict(_GIT_ENV, HOME=str(repo)))
 
 
+def _write(path: Path, content: str) -> None:
+    """Écrit ``content`` tel quel : ``write_text`` traduirait les fins de ligne LF en CRLF sous Windows, et le
+    blob (donc ``show_file``) ne serait plus celui attendu."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content.encode("utf-8"))
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     _git(tmp_path, "init", "-q", "-b", "main")
-    (tmp_path / ".gitignore").write_text("ignored/\n*.log\n")
+    _write(tmp_path / ".gitignore", "ignored/\n*.log\n")
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("print('a')\n")
-    (tmp_path / "src" / "b.py").write_text("print('b')\n")
+    _write(tmp_path / "src" / "a.py", "print('a')\n")
+    _write(tmp_path / "src" / "b.py", "print('b')\n")
     (tmp_path / "ignored").mkdir()
-    (tmp_path / "ignored" / "junk.txt").write_text("x")
-    (tmp_path / "debug.log").write_text("x")
+    _write(tmp_path / "ignored" / "junk.txt", "x")
+    _write(tmp_path / "debug.log", "x")
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-q", "-m", "init")
     return tmp_path
@@ -46,16 +53,16 @@ def test_not_a_repo(tmp_path: Path):
 
 
 def test_ls_files_respects_gitignore_and_includes_untracked(repo: Path):
-    (repo / "src" / "new.py").write_text("print('new')\n")
+    _write(repo / "src" / "new.py", "print('new')\n")
     files = GitRepo(str(repo)).ls_files()
     assert "src/a.py" in files and "src/new.py" in files
     assert "ignored/junk.txt" not in files and "debug.log" not in files
 
 
 def test_diff_names_working_tree(repo: Path):
-    (repo / "src" / "a.py").write_text("print('A')\n")
+    _write(repo / "src" / "a.py", "print('A')\n")
     (repo / "src" / "b.py").unlink()
-    (repo / "src" / "c.py").write_text("print('c')\n")
+    _write(repo / "src" / "c.py", "print('c')\n")
     changes = {c.path: c.status for c in GitRepo(str(repo)).diff_names()}
     assert changes == {"src/a.py": "M", "src/b.py": "D", "src/c.py": "?"}
 
@@ -63,7 +70,7 @@ def test_diff_names_working_tree(repo: Path):
 def test_diff_names_range_and_rename(repo: Path):
     g = GitRepo(str(repo))
     _git(repo, "mv", "src/a.py", "src/renamed.py")
-    (repo / "src" / "b.py").write_text("print('bb')\n")
+    _write(repo / "src" / "b.py", "print('bb')\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "second")
     changes = g.diff_names("HEAD~1..HEAD")
@@ -90,7 +97,7 @@ def test_log_and_show(repo: Path):
 
 def test_empty_repo_without_commits(tmp_path: Path):
     _git(tmp_path, "init", "-q", "-b", "main")
-    (tmp_path / "x.txt").write_text("x")
+    _write(tmp_path / "x.txt", "x")
     g = GitRepo(str(tmp_path))
     assert g.head() is None and g.log() == []
     assert [c.status for c in g.diff_names()] == ["?"]

@@ -326,9 +326,10 @@ def test_impact_from_git_after_editing_order_service(env: SimpleNamespace):
     analyzer = env.analyzer
     assert analyzer.from_git("backend").changed == []  # arbre propre
     service = env.project / "backend" / "app" / "Services" / "OrderService.php"
-    original = service.read_text(encoding="utf-8")
-    service.write_text(original.replace("$order->status = 'confirmed';", "$order->status = 'validated';"),
-                       encoding="utf-8")
+    # octets, pas write_text : sous Windows celui-ci traduirait LF en CRLF, l'empreinte du fichier restauré
+    # changerait et l'index serait vu comme obsolète (tests suivants : touch, second run incrémental)
+    original = service.read_bytes().decode("utf-8")
+    service.write_bytes(original.replace("$order->status = 'confirmed';", "$order->status = 'validated';").encode("utf-8"))
     try:
         report = analyzer.from_git("backend")
         (entry,) = report.changed
@@ -343,7 +344,7 @@ def test_impact_from_git_after_editing_order_service(env: SimpleNamespace):
         # les autres dépôts du même dépôt Git ne voient pas ce changement
         assert analyzer.from_git("frontend").changed == []
     finally:
-        service.write_text(original, encoding="utf-8")
+        service.write_bytes(original.encode("utf-8"))
     assert analyzer.from_git("backend").changed == []
 
 

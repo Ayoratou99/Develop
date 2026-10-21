@@ -65,8 +65,10 @@ def _symlink(target: Path, link: Path) -> None:
 
 
 def _write(path: Path, content: str = "x\n") -> Path:
+    """Écrit ``content`` tel quel (octets UTF-8) : ``write_text`` traduirait les fins de ligne LF en CRLF sous
+    Windows, et les tailles, empreintes et contenus relus ne seraient plus ceux attendus."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_bytes(content.encode("utf-8"))
     return path
 
 
@@ -145,7 +147,7 @@ def test_default_exclusions_user_content_dirs(tmp_path: Path):
     par l'application (``media``, ``uploads``, ``attachments``, ``backups``, ``dumps``…) sont exclus par défaut,
     comme ``vendor/`` ; un dossier de documentation sous ``public/`` reste parcouru."""
     (tmp_path / "app" / "Models").mkdir(parents=True)
-    (tmp_path / "app" / "Models" / "User.php").write_text("<?php\nclass User {}\n", encoding="utf-8")
+    _write(tmp_path / "app" / "Models" / "User.php", "<?php\nclass User {}\n")
     (tmp_path / "public" / "documentation").mkdir(parents=True)
     (tmp_path / "public" / "documentation" / "guide.pdf").write_bytes(b"%PDF-1.4\n%guide\n")
     for rel, data in (("docker/migration/media/media/4/attestation.pdf", b"%PDF-1.4\n%nom prenom piece\n"),
@@ -243,7 +245,8 @@ def test_scan_fixture_basics(fixture_scan: ScanResult, sample_project: Path):
     # 30 fichiers - node_modules (dossier) - logo.png (binaire) - .gitignore (sans langage)
     assert len(paths) == 27
     assert all(isinstance(f, FileEntry) and f.repo_id == "fx" and f.size > 0 and f.mtime > 0 for f in fixture_scan.files)
-    assert all(os.path.isabs(f.abs_path) and f.abs_path.endswith(f.path) for f in fixture_scan.files)
+    # abs_path est dans la forme native du système (antislashs sous Windows), path toujours en « / »
+    assert all(os.path.isabs(f.abs_path) and f.abs_path.replace(os.sep, "/").endswith(f.path) for f in fixture_scan.files)
 
 
 def test_scan_fixture_exclusions(fixture_scan: ScanResult):

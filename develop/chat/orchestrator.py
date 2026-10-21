@@ -1292,14 +1292,16 @@ class ChatOrchestrator:
                 # la mesure de vitesse de lecture ; le prompt est gardé après l'appel pour les comparaisons suivantes
                 prompt_text = self._prompt_text(messages, tools_sent)
                 cached_fraction = self._cached_fraction(model, prompt_text) if calls_made == 0 else 0.0
-                sent_at = time.monotonic()  # la requête part au premier parcours du flux
+                # perf_counter, pas monotonic : sous Windows (Python < 3.13) monotonic() n'avance que toutes les
+                # ~15,6 ms, un délai nul y passerait pour « non mesurable » et la vitesse de lecture ne serait jamais apprise
+                sent_at = time.perf_counter()  # la requête part au premier parcours du flux
                 first_chunk_at: Optional[float] = None  # premier fragment, quel qu'il soit (délai perçu)
                 first_text_at: Optional[float] = None  # premier fragment de texte, s'il précède tout appel d'outil
                 prefill_measurable = True
                 call_usage: Dict[str, int] = {}
                 try:
                     async for chunk in stream:
-                        now = time.monotonic()
+                        now = time.perf_counter()
                         if first_chunk_at is None:
                             first_chunk_at = now
                         if cancel is not None and cancel.is_set():

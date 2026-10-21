@@ -75,7 +75,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$CI_LOGS" "$DEVELOP_HOME"
-          python -m pytest tests -o addopts='' -q --durations=10 2>&1 | tee "$CI_LOGS/output.log"
+          python -m pytest tests -o addopts='' -q -rs --durations=10 2>&1 | tee "$CI_LOGS/output.log"
 
       - name: Tests (pytest, Windows)
         if: runner.os == 'Windows'
@@ -86,7 +86,7 @@ jobs:
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $OutputEncoding = [System.Text.Encoding]::UTF8
           New-Item -ItemType Directory -Force -Path $env:CI_LOGS, $env:DEVELOP_HOME | Out-Null
-          python -m pytest tests -o addopts='' -q --durations=10 2>&1 | Tee-Object -FilePath (Join-Path $env:CI_LOGS 'output.log')
+          python -m pytest tests -o addopts='' -q -rs --durations=10 2>&1 | Tee-Object -FilePath (Join-Path $env:CI_LOGS 'output.log')
           $code = $LASTEXITCODE
           if ($null -eq $code) { $code = 1 }
           exit $code
