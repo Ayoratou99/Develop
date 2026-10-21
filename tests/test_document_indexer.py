@@ -702,3 +702,136 @@ def test_glossaire_json_loaded_then_chunked(sample_project: Path):
     assert len(chunks) == 1 and chunks[0].meta["kind"] == "data"
     assert chunks[0].line_start == 1 and chunks[0].line_end == len(doc.text.splitlines())
     assert "Stock Keeping Unit" in chunks[0].text
+
+
+def test_prose_chunks_never_cross_page_breaks():
+    """Un morceau de prose ne chevauche jamais un saut de page (``\\f``, séparateur des pages d'un PDF) :
+    le libellé « page N » calculé par l'indexeur sur sa première ligne est exact, et le rappel des dernières
+    phrases ne remonte jamais à la page précédente (sinon un morceau « page 9 » montre le début de la page 10)."""
+    pages = [
+        "Le paramétrage décrit les champs. Chaque champ porte une clé et un libellé.\n"
+        "Le contexte de commande est transmis s'il est connu :\n",
+        "// GET /form-templates/all?populate=blocks\nLes identifiants sont des UUID. Le serveur revalide la colonne.\n",
+        "Fin.\n",  # page très courte : un morceau à elle seule, jamais réunie à la page précédente
+    ]
+    text = PAGE_SEPARATOR.join(pages)
+    page_of_line = {}
+    page, lineno = 1, 1
+    for raw in text.splitlines(keepends=True):
+        page_of_line[lineno] = page
+        lineno += 1
+        if raw.endswith(PAGE_SEPARATOR):
+            page += 1
+    for max_chars in (60, 200, 1500):
+        chunks = chunk_text(text, "prose", max_chars=max_chars, overlap_chars=max_chars // 4)
+        _check_invariants(chunks, text, max_chars)
+        for c in chunks:
+            assert page_of_line[c.line_start] == page_of_line[c.line_end], (max_chars, c.line_start, c.line_end, c.text)
+        first_of_page2 = next(c for c in chunks if page_of_line[c.line_start] == 2)
+        assert first_of_page2.text.startswith("// GET /form-templates/all"), (max_chars, first_of_page2.text)
+        assert "Fin." in [c.text for c in chunks]
+    # Un bloc qui enjambe un saut de page sans ligne vide (texte brut) est coupé au saut ;
+    # sans saut de page, deux courts paragraphes restent réunis comme avant.
+    assert [c.text for c in chunk_text("alpha\fbeta", "prose")] == ["alpha", "beta"]
+    assert len(chunk_text("alpha\n\nbeta\n", "prose")) == 1
+
+
+# --------------------------------------------------------------------------- PDF : en-tête courant, sections numérotées
+
+def _make_pdf_pages(path: Path, pages: List[List[str]]) -> None:
+    """PDF minimal valide avec plusieurs lignes de texte par page (une ligne par élément, de haut en bas)."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, StreamObject
+
+    writer = PdfWriter()
+    add_object = getattr(writer, "add_object", None) or getattr(writer, "_add_object")
+    for lines in pages:
+        page = writer.add_blank_page(width=300, height=300)
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): add_object(font)}),
+        })
+        stream = StreamObject()
+        ops = "BT /F1 12 Tf 20 280 Td " + " ".join("(%s) Tj 0 -16 Td" % line for line in lines) + " ET"
+        stream.set_data(ops.encode("latin-1"))
+        page[NameObject("/Contents")] = add_object(stream)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+
+
+def test_load_pdf_strips_running_header_and_page_numbers(tmp_path: Path):
+    """L'en-tête courant (« FUIP - Guide » en tête de chaque page) et les numéros de page sortent du texte :
+    sinon chaque morceau « contient » le titre du document et la recherche lexicale ne les distingue plus."""
+    from develop.document_indexer import PAGE_SEPARATOR, strip_page_furniture
+
+    pdf = tmp_path / "guide.pdf"
+    _make_pdf_pages(pdf, [["FUIP - Guide", "1", "Sommaire", "1. Intro", "2. Suite"],
+                          ["FUIP - Guide", "2", "1. Intro", "Texte introductif."],
+                          ["FUIP - Guide", "3", "2. Suite", "Texte de la suite."],
+                          ["FUIP - Guide", "4", "Fin du guide."]])
+    doc = load_document(str(pdf))
+    assert doc.pages == 4 and doc.warnings == []
+    assert "FUIP - Guide" not in doc.text and doc.meta["running_lines"] == ["FUIP - Guide", "1", "2", "3", "4"]
+    pages = doc.text.split(PAGE_SEPARATOR)
+    assert pages[0] == "Sommaire\n1. Intro\n2. Suite\n" and pages[1] == "1. Intro\nTexte introductif.\n" and pages[3] == "Fin du guide.\n"
+    # les décalages de pages suivent le texte nettoyé : chaque morceau retrouve sa page ; les titres numérotés
+    # ouvrent des sections (le sommaire, lignes numérotées qui se suivent, reste un bloc sans titre)
+    chunks = chunk_for_file(doc.text, "pdf", "document", max_chars=60, overlap_chars=0)
+    _check_invariants(chunks, doc.text, 60)
+    line_offsets = []
+    pos = 0
+    for raw in doc.text.splitlines(keepends=True):
+        line_offsets.append(pos)
+        pos += len(raw)
+    by_page = {page_for_offset(doc.meta["page_offsets"], line_offsets[c.line_start - 1]): c for c in chunks}
+    assert by_page[2].text == "1. Intro\nTexte introductif." and by_page[2].meta["section"] == "1. Intro"
+    assert by_page[3].text.startswith("2. Suite\nTexte de la suite.") and by_page[3].meta["heading_path"] == ["2. Suite"]
+    assert by_page[1].text == "Sommaire\n1. Intro\n2. Suite" and "heading_path" not in by_page[1].meta
+    # fonction pure : deux pages ne font pas une répétition ; une ligne répétée après du contenu n'est pas un
+    # en-tête (le retrait s'arrête à la première ligne de contenu) ; « page 3 / 3 » est un numéro de page
+    assert strip_page_furniture(["A\nx\n", "A\ny\n"]) == (["A\nx\n", "A\ny\n"], [])
+    cleaned, removed = strip_page_furniture(["Titre\nun\nNote\nx\npage 1 / 3\n", "Titre\ndeux\nNote\ny\npage 2 / 3\n",
+                                             "Titre\ntrois\nNote\nz\npage 3 / 3\n"])
+    assert cleaned == ["un\nNote\nx\n", "deux\nNote\ny\n", "trois\nNote\nz\n"]
+    assert removed == ["Titre", "page 1 / 3", "page 2 / 3", "page 3 / 3"]
+    # un en-tête présent sur une page sur trois n'est pas « courant » ; une page vide ne compte pas
+    assert strip_page_furniture(["H\na\n", "b\n", "c\n", ""])[1] == []
+
+
+def test_chunk_prose_numbered_sections_carry_heading_path():
+    """Un document en prose (PDF, texte) découpé par ses titres numérotés : « 4. Les champs » est un morceau
+    qui commence par son titre et porte ``heading_path`` / ``section``, pas la fin de la section 3 suivie du
+    début de la 4 ; un sommaire, une liste d'étapes ou une date ne sont pas des titres."""
+    from develop.document_indexer import numbered_heading
+
+    text = ("Guide\nSommaire\n1. Intro\n2. Modèle\n3. Fin\n\n1. Intro\nPremière phrase de l'intro. Deuxième phrase de l'intro.\n\n"
+            "2. Modèle\n2.1 Tables\nLes tables sont décrites ici.\n\n27 juillet 2025\nUne date n'est pas un titre.\n\n"
+            "3. Fin\nDernier paragraphe.\n")
+    chunks = chunk_text(text, "prose", max_chars=1500, overlap_chars=150)
+    _check_invariants(chunks, text, 1500)
+    assert [c.text.splitlines()[0] for c in chunks] == ["Guide", "1. Intro", "2. Modèle", "3. Fin"]
+    assert "heading_path" not in chunks[0].meta and chunks[0].text.endswith("3. Fin")  # sommaire : bloc sans titre
+    assert chunks[1].meta["heading_path"] == ["1. Intro"] and chunks[1].meta["section"] == "1. Intro"
+    assert chunks[2].meta["heading_path"] == ["2. Modèle", "2.1 Tables"] and chunks[2].meta["section"] == "2.1 Tables"
+    assert "27 juillet 2025" in chunks[2].text  # une date n'ouvre pas de section
+    assert chunks[3].text == "3. Fin\nDernier paragraphe." and chunks[3].meta["kind"] == "prose"
+    # section longue : plusieurs morceaux, tous titrés ; une nouvelle section commence par son titre, sans
+    # rappel des dernières phrases de la précédente
+    long = "4. Détails\n" + " ".join("Phrase %d de la section quatre." % i for i in range(40)) + "\n\n5. Suite\nTexte court.\n"
+    chunks = chunk_text(long, "prose", max_chars=200, overlap_chars=50)
+    _check_invariants(chunks, long, 200)
+    four = [c for c in chunks if c.meta.get("section") == "4. Détails"]
+    assert len(four) >= 4 and four[0].text.startswith("4. Détails\nPhrase 0") and len(four) == len(chunks) - 1
+    assert all(c.meta["heading_path"] == ["4. Détails"] for c in four)
+    assert chunks[-1].text == "5. Suite\nTexte court." and chunks[-1].meta["section"] == "5. Suite"
+    # les étapes d'une liste et les dates ne sont pas des titres ; un sous-titre a un niveau
+    assert numbered_heading("1. Créer le template puis le téléverser.") is None
+    assert numbered_heading("27 juillet 2025") is None and numbered_heading("10. 30 €") is None
+    assert numbered_heading("2.1 Modèle") == (2, "2.1 Modèle") and numbered_heading("4. Les champs (custom)") == (1, "4. Les champs (custom)")
+    # texte sans titre numéroté : découpage inchangé (un seul morceau, sans heading_path)
+    plain = chunk_text("Un paragraphe.\n\nUn autre paragraphe.\n", "prose")
+    assert len(plain) == 1 and "heading_path" not in plain[0].meta

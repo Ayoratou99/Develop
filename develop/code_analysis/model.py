@@ -117,7 +117,7 @@ def normalize_route_path(path: str) -> str:
     - supprime la chaîne de requête et le fragment ;
     - remplace tout paramètre (``{order}``, ``:id``, ``${id}``, ``<int:pk>``, ``[id]``, ``$id``,
       segment purement numérique) par ``:param`` ;
-    - compacte les ``/`` doubles, retire le ``/`` final, impose un ``/`` initial, minuscules.
+    - réduit les ``/`` doubles, retire le ``/`` final, impose un ``/`` initial, minuscules.
     Exemple : ``/orders/${id}/confirm`` et ``/orders/{order}/confirm`` → ``/orders/:param/confirm``.
     """
     p = (path or "").strip().strip("'\"`")

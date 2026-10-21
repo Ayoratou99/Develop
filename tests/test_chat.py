@@ -23,11 +23,14 @@ from develop.chat import (
     estimate_tokens,
     render_sources_for_model,
 )
-from develop.chat.budget import (MAX_ANSWER_RESERVE, MIN_ANSWER_RESERVE, MIN_TOOL_BUDGET, system_prompt_tokens,
-                                 tool_specs_tokens)
-from develop.chat.context_builder import LocalHit, render_sources_as_text
+from develop.chat.budget import (MAX_ANSWER_RESERVE, MAX_HISTORY_TOKENS, MIN_ANSWER_RESERVE, MIN_HISTORY_TOKENS,
+                                 MIN_TOOL_BUDGET, SYSTEM_TOKENS_CAP, answer_reserve_for, history_tokens_for,
+                                 system_prompt_tokens, system_text_tokens, tool_specs_tokens)
+from develop.chat.context_builder import (GRAPH_FILE_PREVIEW_LINES, IMPORTS_OMITTED_MARKER, LocalHit, _CardLoader,
+                                          _fit_sections, _repo_prefix, _request_section, build_cards, format_block,
+                                          format_header, render_sources_as_text)
 from develop.chat.orchestrator import (INTERRUPTED_PREFIX, SOURCES_FRAME_TOKENS, TOOLS_EXHAUSTED_TEXT, _message_tokens,
-                                       find_invalid_citations)
+                                       find_invalid_citations, followup_terms, is_smalltalk, smalltalk_reply)
 from develop.chat.prompts import HISTORY_SUMMARY_PREFIX, SYSTEM_PROMPT, TOOLS_TEXT_PROTOCOL
 from develop.chat.tools import TRUNCATED_NOTE, ToolResult, fit_text
 from develop.config import LLMConfig, RepoConfig, WorkspaceConfig
@@ -330,8 +333,22 @@ def seeded(db: Database, sample_project: Path) -> Dict[str, Any]:
     return seed_index(db, sample_project)
 
 
+def without_model_phase_statuses(events: List[ChatEvent]) -> List[ChatEvent]:
+    """Retire les ``status`` informatifs émis après ``sources`` (chargement du modèle, lecture des sources) :
+    leur présence dépend du moteur et du mode, pas de la logique testée ; les indices restent stables."""
+    out: List[ChatEvent] = []
+    seen_sources = False
+    for e in events:
+        if e.type == "sources":
+            seen_sources = True
+        if e.type == "status" and seen_sources:
+            continue
+        out.append(e)
+    return out
+
+
 async def collect(orch: ChatOrchestrator, conversation_id: int, text: str, **kwargs: Any) -> List[ChatEvent]:
-    return [ev async for ev in orch.respond(conversation_id, text, **kwargs)]
+    return without_model_phase_statuses([ev async for ev in orch.respond(conversation_id, text, **kwargs)])
 
 
 def types(events: List[ChatEvent]) -> List[str]:
@@ -397,13 +414,77 @@ def test_compute_budget_partition_is_consistent():
         assert b.system_tokens + b.history_tokens_max + b.context_tokens_max + b.answer_reserve <= b.num_ctx
         assert b.total <= b.num_ctx
         assert MIN_ANSWER_RESERVE <= b.answer_reserve <= MAX_ANSWER_RESERVE
-        assert b.history_tokens_max >= min(768, b.num_ctx // 4)
-        assert b.history_tokens_max <= max(1024, int(b.num_ctx * 0.12))
+        assert b.history_tokens_max >= min(MIN_HISTORY_TOKENS, b.num_ctx // 4)
+        assert b.history_tokens_max <= min(MAX_HISTORY_TOKENS, max(MIN_HISTORY_TOKENS, b.num_ctx // 10))
         assert b.context_tokens_max > 0
     big = compute_budget(LLMConfig(num_ctx=16384, max_context_chars=1_000_000), info(16384), None, intent="factual")
-    # les consignes sont mesurées sur le vrai gabarit (définitions d'outils natifs comprises), pas devinées
-    assert big.system_tokens == system_prompt_tokens("native", 16384) and big.answer_reserve == int(16384 * 0.30)
+    # les consignes sont mesurées sur le vrai gabarit (définitions d'outils natifs comprises), pas devinées ;
+    # la réserve de réponse est 20 % de la fenêtre, plafonnée à 3k (une réponse citée n'en demande pas plus)
+    assert big.system_tokens == system_prompt_tokens("native", 16384) and big.answer_reserve == MAX_ANSWER_RESERVE == 3072
     assert big.tools_mode == "native" and big.tool_rounds_max == 4 and big.tools_tokens_max >= MIN_TOOL_BUDGET
+
+
+@pytest.mark.parametrize("ctx,history,answer", [(2048, 768, 1024), (4096, 768, 1024), (8192, 819, 1638),
+                                                (16384, 1638, 3072), (32768, 2048, 3072), (65536, 2048, 3072)])
+def test_compute_budget_history_and_answer_follow_window(ctx, history, answer):
+    # historique = min(max(768, 10 % de num_ctx), 2048) ; réponse = clamp(20 % de num_ctx, 1024, 3072)
+    assert history_tokens_for(ctx) == history and answer_reserve_for(ctx) == answer
+    b = compute_budget(LLMConfig(num_ctx=ctx), info(ctx), None, tools_mode="none")
+    assert b.answer_reserve == answer and b.history_tokens_max <= history
+    if ctx >= 4096:
+        assert b.history_tokens_max == history  # la fenêtre porte l'historique entier ; à 2048 il cède au contexte
+    assert "10 %% de num_ctx, entre %d et %d" % (MIN_HISTORY_TOKENS, MAX_HISTORY_TOKENS) in b.source
+    assert "20 %% de num_ctx, entre %d et %d" % (MIN_ANSWER_RESERVE, MAX_ANSWER_RESERVE) in b.source
+
+
+@pytest.mark.parametrize("ctx,floor", [(8192, 3000), (16384, 7500), (32768, 15000)])
+def test_compute_budget_context_floor_per_window(ctx, floor):
+    # Régression : à 8192 en natif le contexte récupéré ne faisait que 1081 tokens (forfait système 1622 + réponse 30 %)
+    # alors que la fenêtre contenait tout ce qu'il fallait ; objectifs : ≥ 3k à 8k, ≥ 7,5k à 16k, ≥ 15k à 32k.
+    cfg = LLMConfig(num_ctx=ctx)  # max_context_chars par défaut (96 000 ≈ 24k tokens) : ne bride pas ces paliers
+    for mode in ("native", "text", "none"):
+        for intent in ("factual", "fields", "howto", "decision"):
+            b = compute_budget(cfg, info(ctx), profile(64), intent=intent, tools_mode=mode, question_tokens=40)
+            assert b.context_tokens_max >= floor, (ctx, mode, intent, b.source)
+            assert b.total <= ctx and b.tools_mode == mode and b.tool_rounds_max == (0 if mode == "none" else 4)
+        factual = compute_budget(cfg, info(ctx), profile(64), intent="factual", tools_mode=mode).context_tokens_max
+        for wide in ("impact", "broad"):
+            w = compute_budget(cfg, info(ctx), profile(64), intent=wide, tools_mode=mode)
+            assert w.context_tokens_max >= factual and w.total <= ctx
+            if mode != "none":
+                assert w.context_tokens_max > factual and "90 % du reste" in w.source
+    native = compute_budget(cfg, info(ctx), profile(64), intent="factual", tools_mode="native")
+    assert "80 % du reste" in native.source and native.tools_tokens_max >= MIN_TOOL_BUDGET
+
+
+def test_compute_budget_system_tokens_are_prompt_plus_margin_not_a_flat_fee():
+    # consignes = gabarit mesuré + 10 % de marge (plafond 1500), définitions d'outils natifs en sus (jamais plafonnées)
+    shape = compute_budget(LLMConfig(num_ctx=8192), info(8192), None, tools_mode="none")
+    for mode in ("native", "text", "none"):
+        real = estimate_tokens(build_system_prompt(mode, shape, "", "", "2026-01-01"))
+        text = system_text_tokens(mode, 8192)
+        assert text == min(SYSTEM_TOKENS_CAP, int(real * 1.1 + 0.999)) and real < text <= SYSTEM_TOKENS_CAP
+        assert system_prompt_tokens(mode, 8192) == text + (tool_specs_tokens() if mode == "native" else 0)
+    b = compute_budget(LLMConfig(num_ctx=8192), info(8192), None, tools_mode="text")
+    assert b.system_tokens == system_prompt_tokens("text", 8192) < 1100 and "10 % de marge" in b.source
+    # une liste de dépôts démesurée ne mange pas la fenêtre : l'estimation des consignes textuelles est plafonnée
+    assert system_text_tokens("text", 8192, repos_summary="x" * 20_000) == SYSTEM_TOKENS_CAP
+
+
+def test_eight_sources_of_350_tokens_fit_in_context_at_8192():
+    # À 8192 (natif, factuel) : au moins 8 passages de ≈ 350 tokens tiennent dans le contexte récupéré.
+    b = compute_budget(LLMConfig(num_ctx=8192), info(8192), None, intent="factual", tools_mode="native", question_tokens=30)
+    assert b.context_tokens_max >= 8 * 350
+    line = "        $this->validate($request, ['status' => 'required|in:draft,confirmed']); // champ %02d\n"
+    body = "".join(line % j for j in range(13))  # ≈ 1 200 caractères de code ≈ 350 tokens
+    assert 330 <= estimate_tokens(body, is_code=True) <= 370
+    hits = [file_hit(chunk_id=10 + i, source_id=10 + i, file_id=10 + i, path="app/Models/Model%d.php" % i,
+                     title="Model%d.php" % i, line_start=1, line_end=13, text=body, score=0.9 - i * 0.01)
+            for i in range(8)]
+    pack = build_context(hits, budget_tokens=b.context_tokens_max, intent="factual")
+    assert len(pack.sources) == 8 and not pack.truncated and pack.tokens_used <= b.context_tokens_max
+    # chaque passage est entier : dernière ligne présente, aucune coupure
+    assert all("champ 12" in pack.blocks[s.ref] and "tronqué" not in pack.blocks[s.ref] for s in pack.sources)
 
 
 def test_compute_budget_partition_never_exceeds_window():
@@ -459,7 +540,8 @@ def test_compute_budget_intents_change_context_share():
     shares = {intent: compute_budget(cfg, info(16384), None, intent=intent).context_tokens_max
               for intent in ("factual", "fields", "howto", "who_calls", "impact", "decision", "broad", "inconnu")}
     assert shares["factual"] == shares["fields"] == shares["howto"] == shares["decision"] == shares["inconnu"]
-    assert shares["factual"] < shares["who_calls"] < shares["broad"] < shares["impact"]
+    # 80 % du reste pour une question ciblée, 85 % pour les appelants, 90 % pour l'impact et les questions larges
+    assert shares["factual"] < shares["who_calls"] < shares["broad"] == shares["impact"]
     assert "impact" in compute_budget(cfg, info(16384), None, intent="impact").source
 
 
@@ -474,6 +556,19 @@ def test_compute_budget_override_and_max_context_chars():
     assert compute_budget(LLMConfig(num_ctx=16384), info(16384), None, override_context_tokens=10**7).context_tokens_max \
         == compute_budget(LLMConfig(num_ctx=16384), info(16384), None).context_tokens_max
     assert compute_budget(LLMConfig(num_ctx=16384), info(16384), None, override_context_tokens=1).context_tokens_max == 256
+
+
+def test_max_context_chars_default_and_legacy_value_upgraded():
+    # 96 000 caractères ≈ 24k tokens : le plafond ne bride plus le contexte récupéré avant 32k de fenêtre…
+    assert LLMConfig().max_context_chars == 96_000
+    b = compute_budget(LLMConfig(num_ctx=32768), info(32768), profile(64), intent="factual")
+    assert b.context_tokens_max > 15_000 and "max_context_chars" not in b.source
+    # … et l'ancien défaut (24 000, écrit en clair dans chaque workspace.json) est relu comme le nouveau défaut,
+    # une autre valeur explicite est respectée
+    assert LLMConfig(max_context_chars=24_000).max_context_chars == 96_000
+    assert LLMConfig.model_validate({"max_context_chars": 24000}).max_context_chars == 96_000
+    assert LLMConfig(max_context_chars=20_000).max_context_chars == 20_000
+    assert compute_budget(LLMConfig(num_ctx=32768, max_context_chars=20_000), info(32768), profile(64)).context_tokens_max == 5_000
 
 
 def test_budget_to_dict_and_tolerant_inputs():
@@ -561,6 +656,123 @@ def test_build_context_dedupes_and_caps_per_file():
     assert build_context([], 0).text == ""
 
 
+def test_build_context_previews_files_reached_by_the_graph_only():
+    """Projet réel : un fichier relié par le graphe seul (importateur d'une classe, fichier utilisant un modèle)
+    entrait par son premier morceau — namespace, dix lignes ``use``, déclaration — soit 300 à 400 tokens par
+    fichier et jusqu'à 70 % du contexte. La relation est la preuve : le passage devient un aperçu (en-tête omis,
+    GRAPH_FILE_PREVIEW_LINES lignes, reste compté) ; un fichier trouvé aussi par un autre canal reste entier."""
+    header = ("# backend/app/Http/Controllers/EmpruntController.php L1-40\n<?php\n\nnamespace Modules\\Bibliotheque\\Http;\n\n"
+              + "".join("use Modules\\Bibliotheque\\Models\\Model%d;\n" % i for i in range(10))
+              + "\nclass EmpruntController extends Controller\n{\n    public function __construct(EmpruntService $service)\n"
+              "    {\n        parent::__construct($service);\n    }\n\n"
+              + "".join("    public function action%d(Request $request): JsonResponse\n    {\n"
+                        "        return $this->paginateModel($request->only(['sort']));\n    }\n\n" % i for i in range(5)))
+    linked = file_hit(chunk_id=1, source_id=1, file_id=1, path="app/Http/Controllers/EmpruntController.php",
+                      title="EmpruntController.php", line_start=1, line_end=40, channels=["graph"],
+                      reason="relié à Emprunt via utilisation du modèle", text=header,
+                      extra={"language": "php", "repo_name": "backend", "relation": "uses_model", "via": "Emprunt"})
+    matched = file_hit(chunk_id=2, source_id=2, file_id=2, path="app/Http/Controllers/LivreController.php", score=0.8,
+                       title="LivreController.php", line_start=1, line_end=40, channels=["graph", "lexical"],
+                       reason="relié à Emprunt via imports ; correspondance lexicale sur « livre »", text=header,
+                       extra={"language": "php", "repo_name": "backend", "relation": "imports"})
+    short = file_hit(chunk_id=3, source_id=3, file_id=3, path="app/Http/Requests/IndexEmpruntRequest.php", score=0.7,
+                     title="IndexEmpruntRequest.php", line_start=1, line_end=7, channels=["graph"],
+                     reason="relié à Emprunt via utilisation du modèle", extra={"language": "php", "repo_name": "backend"},
+                     text="class IndexEmpruntRequest extends FormRequest\n{\n    public function authorize(): bool\n"
+                          "    {\n        return true;\n    }\n}")
+    pack = build_context([linked, matched, short], budget_tokens=4000)
+    assert [s.ref for s in pack.sources] == ["S1", "S2", "S3"] and pack.truncated == []
+    b1, b2, b3 = pack.blocks["S1"], pack.blocks["S2"], pack.blocks["S3"]
+    # aperçu : en-tête définitif, 13 lignes d'en-tête omises (ligne du morceau, <?php, namespace, dix use), puis
+    # GRAPH_FILE_PREVIEW_LINES lignes non vides (déclaration, constructeur, première action), le reste compté
+    assert b1.startswith("[S1] backend/app/Http/Controllers/EmpruntController.php:L1-40 — relié à Emprunt via utilisation du modèle\n```php\n")
+    body = b1.split("```php\n", 1)[1].rsplit("\n```", 1)[0].splitlines()
+    assert body[0] == IMPORTS_OMITTED_MARKER % 13 and "use Modules" not in b1 and "namespace Modules" not in b1
+    assert body[1] == "class EmpruntController extends Controller" and "parent::__construct($service);" in b1
+    assert len([l for l in body[1:-1] if l.strip()]) == GRAPH_FILE_PREVIEW_LINES and "action0" in b1 and "action1" not in b1
+    assert body[-1] == "… (tronqué : 22 lignes non affichées)"  # 31 lignes utiles après l'en-tête, 9 montrées (dont une vide)
+    assert estimate_tokens(b1, is_code=True) * 3 < estimate_tokens(b2, is_code=True)
+    # trouvé aussi par un mot de la question : montré entier ; passage court sans en-tête : rien à réduire
+    assert "use Modules\\Bibliotheque\\Models\\Model9;" in b2 and "action4" in b2 and "omises" not in b2
+    assert "omises" not in b3 and "non affichées" not in b3 and "return true;" in b3
+    assert pack.tokens_used == sum(estimate_tokens(b, is_code=True) for b in (b1, b2, b3))
+    # l'aperçu entre là où le passage entier ne tenait pas ; trop petit pour lui, il est écarté (jamais tronqué)
+    tight = build_context([linked], budget_tokens=estimate_tokens(b1, is_code=True) + 5)
+    assert tight.blocks["S1"] == b1 and tight.truncated == []
+    assert build_context([linked], budget_tokens=20).sources == []
+
+
+def test_build_context_leaves_out_generated_file_passages_unless_cited_or_alone():
+    """Projet réel : ``storage/api-docs/api-docs.json`` (851 morceaux, étiquette « fichier généré volumineux » du moteur,
+    classé en queue) entrait tout de même à 16k — trois schémas OpenAPI tronqués, 1 358 tokens, rien pour la réponse.
+    Un tel passage n'entre que si la question cite le fichier (canal identifier) ou s'il n'y a aucun autre passage ;
+    écarté, il reste listé dans ``truncated`` avec sa raison."""
+    schema = '"/api/v1/login": {\n  "post": {\n    "summary": "authentification",\n    "tags": ["Auth"]\n  }\n}'
+    generated = [file_hit(chunk_id=10 + i, source_id=9, file_id=9, path="storage/api-docs/api-docs.json", title="api-docs.json",
+                          line_start=19063 + i * 300, line_end=19099 + i * 300, score=0.008 - i / 1000, channels=["lexical"],
+                          reason="correspondance lexicale sur « authentification » (fichier généré volumineux)",
+                          extra={"language": "json", "generated": True, "fts_terms": ["authentification"]}, text=schema)
+                 for i in range(3)]
+    normal = [file_hit(chunk_id=1, source_id=1, file_id=1, path="routes/api.php", title="api.php", score=0.9, channels=["lexical"],
+                       reason="correspondance lexicale sur « login »", text="Route::post('login', [AuthController::class, 'login']);"),
+              file_hit(chunk_id=2, source_id=2, file_id=2, path="app/Services/AuthService.php", title="AuthService.php", score=0.5,
+                       channels=["lexical"], reason="correspondance lexicale sur « authentification »",
+                       text="    public function login(array $credentials): array\n    {\n        return $this->attempt($credentials);\n    }")]
+    pack = build_context(normal + generated, budget_tokens=20000)  # budget large : rien n'est écarté faute de place
+    assert [s.path for s in pack.sources] == ["routes/api.php", "app/Services/AuthService.php"]
+    assert [s.path for s in pack.truncated] == ["storage/api-docs/api-docs.json"] * 3
+    assert all(s.ref == "" and "fichier généré volumineux" in s.reason for s in pack.truncated)
+    assert "api-docs" not in pack.text and pack.tokens_used == build_context(normal, budget_tokens=20000).tokens_used
+    # chemin typique remonté par un autre canal, sans l'étiquette du canal lexical : même règle
+    lock = file_hit(chunk_id=20, source_id=8, file_id=8, path="composer.lock", title="composer.lock", score=0.3, channels=["semantic"],
+                    reason="proximité sémantique", extra={"language": "json"}, text='"name": "laravel/sanctum",\n"version": "v3.2.1"')
+    pack = build_context(normal + [lock], budget_tokens=20000)
+    assert [s.path for s in pack.sources] == ["routes/api.php", "app/Services/AuthService.php"]
+    assert [s.path for s in pack.truncated] == ["composer.lock"]
+    # la question cite le fichier (canal identifier) : il entre, à son rang
+    cited = file_hit(chunk_id=11, source_id=9, file_id=9, path="storage/api-docs/api-docs.json", title="api-docs.json", score=0.95,
+                     line_start=19363, line_end=19399, channels=["identifier", "lexical"], extra={"language": "json", "generated": True},
+                     reason="chemin de fichier « storage/api-docs/api-docs.json » ; correspondance lexicale (fichier généré volumineux)",
+                     text=schema)
+    pack = build_context(normal + generated + [cited], budget_tokens=20000)
+    assert [s.path for s in pack.sources] == ["storage/api-docs/api-docs.json", "routes/api.php", "app/Services/AuthService.php"]
+    assert pack.sources[0].line_start == 19363 and len(pack.truncated) == 3  # les morceaux non cités restent écartés
+    # aucun autre passage : mieux vaut un passage faible qu'un contexte vide
+    pack = build_context(generated, budget_tokens=20000)
+    assert [s.path for s in pack.sources] == ["storage/api-docs/api-docs.json"] * 3 and pack.truncated == []
+    # un autre passage, mais vide : même repli (rien d'autre à montrer)
+    pack = build_context([file_hit(chunk_id=30, source_id=3, file_id=3, path="x.php", text="", snippet="")] + generated, budget_tokens=20000)
+    assert len(pack.sources) == 3 and pack.truncated == []
+
+
+def test_build_context_keeps_one_copy_of_a_passage_indexed_under_two_sources():
+    # même PDF indexé comme fichier du dépôt (file 571) et comme document téléversé (document 2) : mêmes
+    # morceaux, même ``chunks.sha1`` transmis par le moteur dans extra → un seul passage dans le contexte
+    text = "Paramétrage des formulaires\nChaque formulaire déclare ses champs : libellé, type, obligatoire."
+    as_file = file_hit(chunk_id=11, source_id=571, file_id=571, path="public/documentation/parametrage.pdf",
+                       title="parametrage.pdf", line_start=1, line_end=2, score=0.8, channels=["lexical"], text=text,
+                       extra={"language": "pdf", "sha1": "a" * 40})
+    as_doc = doc_hit(chunk_id=22, source_id=2, title="Paramétrage des formulaires de commande", line_start=1, line_end=2,
+                     page=1, score=0.79, text=text, extra={"document_id": 2, "sha1": "a" * 40})
+    other = doc_hit(chunk_id=23, source_id=2, title="Paramétrage des formulaires de commande", line_start=3, line_end=4,
+                    page=2, score=0.7, text="Autre page : les valeurs par défaut.", extra={"document_id": 2, "sha1": "b" * 40})
+    pack = build_context([as_file, as_doc, other], budget_tokens=4000, max_per_file=1)
+    assert [(s.ref, s.source_type, s.line_start) for s in pack.sources] == [("S1", "file", 1), ("S2", "document", 3)]
+    assert pack.text.count("Chaque formulaire déclare") == 1 and pack.truncated == []
+    # le doublon écarté n'a pas consommé la place par source du document (S2 est bien entré malgré max_per_file=1)
+    assert pack.hits_by_ref["S2"] is other
+    # un outil qui ramène le même passage sous l'autre source ne l'ajoute pas ; un texte nouveau, si
+    twin = LocalHit(source_type="document", source_id=2, chunk_id=22, title="Paramétrage des formulaires de commande",
+                    line_start=1, line_end=2, text=text, channels=["tool"], extra={"sha1": "a" * 40})
+    fresh = LocalHit(source_type="note", source_id=9, chunk_id=30, title="Note", text="Les champs obligatoires sont marqués *.",
+                     channels=["tool"], extra={"sha1": "c" * 40})
+    assert [s.source_type for s in add_tool_sources(pack, [twin, fresh], budget_tokens=500)] == ["note"]
+    assert len(pack.sources) == 3 and pack.text.count("Chaque formulaire déclare") == 1
+    # sans empreinte, rien n'est rapproché par le texte : deux fichiers distincts au contenu identique restent deux sources
+    plain = [file_hit(chunk_id=i, source_id=i, file_id=i, path="app/Models/M%d.php" % i, text="<?php // identique") for i in (1, 2)]
+    assert len(build_context(plain, budget_tokens=4000).sources) == 2
+
+
 def test_add_tool_sources_respects_budget_and_skips_covered():
     pack = build_context([file_hit()], budget_tokens=2000)
     covered = LocalHit(source_type="file", source_id=1, path="app/Services/OrderService.php", line_start=12, line_end=20,
@@ -617,6 +829,18 @@ def test_build_system_prompt_modes():
         assert "- %s(" % spec.name in text
     assert "Aucun outil" in none and "tool" not in none.lower().split("aucun outil")[1][:5]
     assert TOOLS_TEXT_PROTOCOL.startswith("Outils (protocole textuel)")
+
+
+def test_system_prompt_asks_for_complete_answers_and_stays_under_900_tokens():
+    # consigne de longueur : complète mais sans délayage, ordre de grandeur donné pour une question factuelle
+    assert "sans délayage" in SYSTEM_PROMPT and "150-300 mots" in SYSTEM_PROMPT
+    # le prompt système (hors définitions d'outils natifs) reste ≤ 900 tokens dans tous les modes, protocole textuel
+    # (le plus long, avec la liste des outils) compris : chaque token de consigne est pris au contexte récupéré
+    budget = compute_budget(LLMConfig(num_ctx=32768), info(32768), None)
+    for mode in ("native", "text", "none"):
+        for repos in ("", "backend (backend), frontend (frontend)"):
+            text = build_system_prompt(mode, budget, "Boutique", repos, "2026-10-17")
+            assert estimate_tokens(text) <= 900, (mode, repos, estimate_tokens(text))
 
 
 # =========================================================================== outils
@@ -1073,6 +1297,7 @@ async def test_respond_cancellation_stores_partial_answer(db: Database, workspac
         events.append(ev)
         if ev.type == "delta":
             cancel.set()
+    events = without_model_phase_statuses(events)
     assert types(events) == ["status", "sources", "delta", "done"]
     done = events[-1].data
     assert done["cancelled"] is True and done["message_id"]
@@ -1108,11 +1333,13 @@ async def test_tool_rounds_and_calls_per_round_are_bounded(db: Database, workspa
 
 
 async def test_history_is_bounded_and_summarized(db: Database, workspace: WorkspaceConfig, seeded):
-    workspace.llm.num_ctx = 4096  # historique ≤ 1024 tokens ≈ 4096 caractères ; chaque message ≈ 354 tokens
+    workspace.llm.num_ctx = 4096  # historique ≤ 768 tokens (10 % de num_ctx, plancher 768) ; chaque message ≈ 250-285 tokens
+    limit = history_tokens_for(4096)
+    assert limit == 768
     conv = db.create_conversation()
     for i in range(6):
-        db.add_message(conv, "user", "Question %d : %s" % (i, "détail " * 200))
-        db.add_message(conv, "assistant", "Réponse %d : %s" % (i, "contenu " * 200))
+        db.add_message(conv, "user", "Question %d : %s" % (i, "détail " * 141))
+        db.add_message(conv, "assistant", "Réponse %d : %s" % (i, "contenu " * 141))
     llm = FakeLLM([text_chunks("ok")])
     orch = make_orchestrator(db, workspace, llm, FakeSearchEngine([file_hit()]), model_info=info(8192, tools=True))
     events = await collect(orch, conv, "Nouvelle question")
@@ -1120,7 +1347,7 @@ async def test_history_is_bounded_and_summarized(db: Database, workspace: Worksp
     messages = llm.calls[0]["messages"]
     system, history, user = messages[0], messages[1:-1], messages[-1]
     assert user.role == "user" and user.content.startswith("Nouvelle question")
-    assert sum(estimate_tokens(m.content) for m in history) <= 1024
+    assert sum(estimate_tokens(m.content) for m in history) <= limit
     # la dernière paire question/réponse entière, jamais une réponse orpheline en tête
     assert [m.role for m in history] == ["user", "assistant"]
     assert history[0].content.startswith("Question 5") and history[1].content.startswith("Réponse 5")
@@ -1134,7 +1361,7 @@ async def test_history_is_bounded_and_summarized(db: Database, workspace: Worksp
     orch3 = make_orchestrator(db, workspace, llm3, FakeSearchEngine([file_hit()]), model_info=info(8192, tools=True))
     await collect(orch3, lone, "Suite")
     hist = llm3.calls[0]["messages"][1:-1]
-    assert len(hist) == 1 and hist[0].content.endswith(" […]") and estimate_tokens(hist[0].content) <= 1024
+    assert len(hist) == 1 and hist[0].content.endswith(" […]") and estimate_tokens(hist[0].content) <= limit
     # une conversation courte : pas de résumé
     short = db.create_conversation()
     db.add_message(short, "user", "Bonjour")
@@ -1229,19 +1456,27 @@ async def test_prompt_plus_reserve_fits_small_windows(db: Database, workspace: W
         call = llm.calls[-1]
         assert sent_tokens(call) + call["max_tokens"] <= ctx, (ctx, tools, sent_tokens(call), done["source"])
         system = call["messages"][0].content
-        if ctx <= 4096:
-            # la fenêtre ne porte pas les outils : ils sont désactivés, leurs définitions ne partent pas
+        if ctx <= 2048 or (ctx <= 4096 and tools):
+            # la fenêtre ne porte pas les outils (2k en tout, ou 4k avec ≈ 1000 tokens de définitions natives) :
+            # ils sont désactivés, leurs définitions ne partent pas
             assert done["tools_mode"] == "none" and call["tools"] is None and "Aucun outil" in system
             assert "outils désactivés" in done["source"]
         else:
+            # 4k en protocole textuel : la réserve de réponse (1k) et l'historique (768) laissent la place d'un résultat
             assert done["tools_mode"] == ("native" if tools else "text")
             assert (call["tools"] == TOOL_SPECS) is tools
-        # le résumé de l'historique tient dans le budget d'historique avec les messages gardés
+        # le résumé de l'historique tient dans le budget d'historique avec les messages gardés. Ce budget est celui
+        # que l'orchestrateur calcule sur les consignes SANS le résumé (il mesure les consignes, dimensionne
+        # l'historique, puis ajoute le résumé aux consignes) : le résumé est compté dans l'historique, pas deux fois.
+        # (Avant la refonte du budget, l'historique cédait moins vite sur une petite fenêtre et l'ancienne mesure,
+        # consignes + résumé, restait sous le plafond par hasard.)
         history = call["messages"][1:-1]
-        summary = system.split(HISTORY_SUMMARY_PREFIX, 1)[1] if HISTORY_SUMMARY_PREFIX in system else ""
-        assert sum(_message_tokens(m) for m in history) + estimate_tokens(HISTORY_SUMMARY_PREFIX + summary) \
+        system_only, _, summary = system.partition("\n\n" + HISTORY_SUMMARY_PREFIX)
+        summary_tokens = estimate_tokens(HISTORY_SUMMARY_PREFIX + summary) if summary else 0
+        measured = estimate_tokens(system_only) + (tool_specs_tokens() if done["tools_mode"] == "native" else 0)
+        assert sum(_message_tokens(m) for m in history) + summary_tokens \
             <= compute_budget(workspace.llm, info(ctx, tools=tools), profile(32), tools_mode=done["tools_mode"],
-                              system_tokens=estimate_tokens(system)).history_tokens_max + 1
+                              system_tokens=measured).history_tokens_max + 1
     workspace.llm.num_ctx = 8192
 
 
@@ -1330,10 +1565,14 @@ async def test_done_budget_counts_initial_context_and_tool_rounds_apart(db: Data
     # ce que la fenêtre laissait aux outils : au plus num_ctx − prompt réel du premier appel − réserve de réponse
     assert 0 < b["tools_tokens_max"] <= 8192 - sent_tokens(llm.calls[0]) - b["answer_reserve"]
     # trois tours : le contexte initial ne bouge pas, la consommation des outils se cumule sous son plafond
+    # (à 16k : à 8k le contexte récupéré vaut ≈ 3,3k tokens, qu'un seul appel peut rapporter, et trois tours de
+    # huit gros passages ne tiennent plus dans ce que la fenêtre laisse aux outils)
+    workspace.llm.num_ctx = 16384
     llm3 = FakeLLM([search, search, search, text_chunks("Fin [S2].")])
     orch3 = make_orchestrator(db, workspace, llm3, FakeSearchEngine([file_hit()], tool_hits=big_tool_hits()),
-                              model_info=info(8192, tools=True))
+                              model_info=info(16384, tools=True))
     b3 = (await collect(orch3, db.create_conversation(), "Quels champs a la table orders ?"))[-1].data["budget"]
+    workspace.llm.num_ctx = 8192
     assert b3["tool_rounds"] == 3 and b3["context_tokens_used"] == b["context_tokens_used"]
     assert b["tools_tokens_used"] < b3["tools_tokens_used"] <= b3["tools_tokens_max"]
     # sans outils (recherche seule, mode sans outils) : rien n'est compté ni réservé pour les outils
@@ -1351,3 +1590,813 @@ def test_chat_view_shows_tool_rounds_apart_from_context():
     js = (Path(__file__).resolve().parents[1] / "develop" / "web" / "static" / "views" / "chat.js").read_text(encoding="utf-8")
     assert "context_tokens_used" in js and "max_context_tokens" in js
     assert "tools_tokens_used" in js and "tools_tokens_max" in js and "tool_rounds" in js
+
+
+# =========================================================================== fiches structurées
+
+
+REQUEST_RULES_BODY = [
+    "    public function rules(): array",
+    "    {",
+    "        $adherentChecker = app(AdherentExistsCheckerInterface::class);",
+    "",
+    "        return [",
+    "            'adherent_id' => ['required', 'uuid', function ($attr, $value, $fail) use ($adherentChecker) {",
+    "                if (!$adherentChecker->exists($value)) $fail('Cet adhérent est inconnu.');",
+    "            }],",
+    "            'date_emprunt' => 'required|date',",
+    "            'agence_id' => 'required|uuid',",
+    "            'motif' => [",
+    "                'nullable', Rule::in(Emprunt::MOTIFS),",
+    "            ],",
+    "            'prolongation' => 'nullable|string|max:255',",
+    "            'status' => ['sometimes', 'string', 'in:A RENDRE,RENDU'],",
+    "            'date_debut' => 'required|date',",
+    "            'exemplaire_id' => ['required', 'uuid', fn ($a, $v, $fail) => $fail('L\\'exemplaire est invalide.')],",
+    "        ];",
+    "    }",
+]
+
+
+def php_lines(total: int, at: Dict[int, Sequence[str]]) -> List[str]:
+    """``total`` lignes de PHP factice, avec des blocs placés à des numéros de ligne précis (1-based)."""
+    lines = ["// ligne %d" % (i + 1) for i in range(total)]
+    for start, block in at.items():
+        for k, text in enumerate(block):
+            lines[start - 1 + k] = text
+    lines[0] = "<?php"
+    return lines
+
+
+def seed_emprunt(db: Database, root: Path, write_request: bool = True) -> Dict[str, Any]:
+    """Entité Laravel complète dans une base vide : modèle Eloquent, migrations (same_entity), FormRequest,
+    contrôleur, routes (handles), Swagger ; ``write_request`` écrit la classe de requête sur le disque."""
+    db.upsert_repo(RepoRow(id="biblio", name="bibliotheque", path=str(root), kind="backend"))
+    files = {
+        "model": FileRow(repo_id="biblio", path="app/Models/Emprunt.php", language="php", kind="code"),
+        "mig1": FileRow(repo_id="biblio", path="database/migrations/2026_02_04_create_emprunts_table.php", language="php", kind="code"),
+        "mig2": FileRow(repo_id="biblio", path="database/migrations/2026_03_11_update_emprunt_motif_to_enum.php", language="php", kind="code"),
+        "request": FileRow(repo_id="biblio", path="app/Http/Requests/StoreEmpruntRequest.php", language="php", kind="code"),
+        "controller": FileRow(repo_id="biblio", path="app/Http/Controllers/Api/V1/EmpruntController.php", language="php", kind="code"),
+        "routes": FileRow(repo_id="biblio", path="routes/api.php", language="php", kind="code"),
+        "swagger": FileRow(repo_id="biblio", path="Documentation/Swagger/EmpruntSwagger.php", language="php", kind="code"),
+    }
+    for f in files.values():
+        db.upsert_file(f)
+    model_lines = php_lines(41, {11: ["class Emprunt extends Model", "{", "    use HasUuids, SoftDeletes;",
+                                     "    protected $fillable = ['livre_id', 'status', 'date_debut', 'date_fin', 'motif', 'commentaire'];"]})
+    md = db.replace_file_artifacts(files["model"].id, symbols=[
+        SymbolRow(name="Emprunt", kind="class", line_start=11, line_end=41, signature="class Emprunt extends Model"),
+        SymbolRow(name="livre", kind="method", parent="Emprunt", line_start=36, line_end=39, signature="function livre(): BelongsTo"),
+    ], models=[ModelRow(name="Emprunt", table_name="emprunts", kind="eloquent", line=11, fields=[
+        {"name": "livre_id", "type": ""}, {"name": "status", "type": ""},
+        {"name": "date_debut", "type": "date", "meta": {"cast": "date"}}, {"name": "date_fin", "type": "date"},
+        {"name": "motif", "type": ""}, {"name": "commentaire", "type": ""}],
+        relations=[{"kind": "belongs_to", "target": "Livre", "field": "livre"}])],
+        chunks=[ChunkRow(text="\n".join(model_lines), line_start=1, line_end=41)])
+    m1 = db.replace_file_artifacts(files["mig1"].id, models=[
+        ModelRow(name="emprunts", table_name="emprunts", kind="migration", line=11, fields=[
+            {"name": "id", "type": "uuid", "nullable": False, "meta": {"primary": True}},
+            {"name": "livre_id", "type": "uuid", "nullable": False, "meta": {"index": True}},
+            {"name": "date_debut", "type": "date", "nullable": False}, {"name": "date_fin", "type": "date", "nullable": True},
+            {"name": "motif", "type": "string", "nullable": False}, {"name": "commentaire", "type": "text", "nullable": True},
+            {"name": "created_at", "type": "timestamp", "nullable": True}]),
+        ModelRow(name="emprunts", table_name="emprunts", kind="migration", line=30, fields=[
+            {"name": "status", "type": "enum", "nullable": False, "default": "A RENDRE", "meta": {"enum_values": ["A RENDRE", "RENDU"]}}]),
+    ])
+    m2 = db.replace_file_artifacts(files["mig2"].id, models=[
+        ModelRow(name="emprunts", table_name="emprunts", kind="migration", line=15, fields=[
+            {"name": "motif", "type": "enum", "nullable": True, "meta": {"enum_values": ["Retour anticipé", "Perte déclarée"]}}]),
+        ModelRow(name="emprunts", table_name="emprunts", kind="migration", line=28,  # down() : ignoré
+                 fields=[{"name": "motif", "type": "string", "nullable": False}]),
+    ])
+    request_lines = php_lines(55, {11: ["class StoreEmpruntRequest extends FormRequest", "{"], 28: REQUEST_RULES_BODY})
+    header = "# app/Http/Requests/StoreEmpruntRequest.php L28-55 rules\n"
+    rq = db.replace_file_artifacts(files["request"].id, symbols=[
+        SymbolRow(name="StoreEmpruntRequest", kind="class", line_start=11, line_end=55,
+                  signature="class StoreEmpruntRequest extends FormRequest", meta={"extends": "FormRequest"}),
+        SymbolRow(name="authorize", kind="method", parent="StoreEmpruntRequest", line_start=15, line_end=18,
+                  signature="function authorize(): bool", meta={"visibility": "public"}),
+        SymbolRow(name="prepareForValidation", kind="method", parent="StoreEmpruntRequest", line_start=20, line_end=26,
+                  signature="function prepareForValidation(): void", meta={"visibility": "protected"}),
+        SymbolRow(name="rules", kind="method", parent="StoreEmpruntRequest", line_start=28, line_end=46,
+                  signature="function rules(): array", meta={"visibility": "public"}),
+    ], chunks=[ChunkRow(text="\n".join(request_lines[:26]), line_start=1, line_end=26),
+               ChunkRow(text=header + "\n".join(request_lines[27:55]), line_start=28, line_end=55, meta={"body_offset": len(header)})])
+    if write_request:
+        target = root / "app" / "Http" / "Requests" / "StoreEmpruntRequest.php"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(request_lines) + "\n", encoding="utf-8")
+    ctl = db.replace_file_artifacts(files["controller"].id, symbols=[
+        SymbolRow(name="EmpruntController", kind="class", line_start=16, line_end=82,
+                  signature="class EmpruntController extends Controller", meta={"extends": "Controller"}),
+        SymbolRow(name="__construct", kind="method", parent="EmpruntController", line_start=18, line_end=21,
+                  signature="function __construct(EmpruntService $service)", meta={"visibility": "public"}),
+        SymbolRow(name="index", kind="method", parent="EmpruntController", line_start=35, line_end=40,
+                  signature="function index(Request $request): JsonResponse", meta={"visibility": "public"}),
+        SymbolRow(name="store", kind="method", parent="EmpruntController", line_start=48, line_end=53,
+                  signature="function store(StoreEmpruntRequest $request): JsonResponse", meta={"visibility": "public"}),
+        SymbolRow(name="update", kind="method", parent="EmpruntController", line_start=55, line_end=60,
+                  signature="function update(Emprunt $emprunt, UpdateEmpruntRequest $request): JsonResponse",
+                  meta={"visibility": "public"}),
+        SymbolRow(name="guard", kind="method", parent="EmpruntController", line_start=70, line_end=75,
+                  signature="function guard(): void", meta={"visibility": "private"}),
+    ])
+    meta = {"prefix": "/v1/bibliotheque", "api_prefix": "/api", "middleware": ["auth:api", "verified"]}
+    rt = db.replace_file_artifacts(files["routes"].id, endpoints=[
+        EndpointRow(side="server", method="GET", path="/emprunts", normalized_path="/api/v1/bibliotheque/emprunts",
+                    handler="EmpruntController@index", framework="laravel", line=81,
+                    meta=dict(meta, full_path="/api/v1/bibliotheque/emprunts", name="emprunts.index")),
+        EndpointRow(side="server", method="POST", path="/emprunts", normalized_path="/api/v1/bibliotheque/emprunts",
+                    handler="EmpruntController@store", framework="laravel", line=81,
+                    meta=dict(meta, full_path="/api/v1/bibliotheque/emprunts", name="emprunts.store")),
+        EndpointRow(side="server", method="PUT", path="/emprunts/{emprunt}", normalized_path="/api/v1/bibliotheque/emprunts/:param",
+                    handler="EmpruntController@update", framework="laravel", line=81,
+                    meta=dict(meta, full_path="/api/v1/bibliotheque/emprunts/{emprunt}", name="emprunts.update")),
+        EndpointRow(side="server", method="DELETE", path="/emprunts/{emprunt}", normalized_path="/api/v1/bibliotheque/emprunts/:param",
+                    handler="EmpruntController@destroy", framework="laravel", line=81,
+                    meta=dict(meta, full_path="/api/v1/bibliotheque/emprunts/{emprunt}", name="emprunts.destroy")),
+        EndpointRow(side="server", method="POST", path="emprunts/{emprunt}/prolonger", normalized_path="/api/v1/bibliotheque/emprunts/:param/prolonger",
+                    handler="EmpruntController@prolongerEmprunt", framework="laravel", line=80,
+                    meta=dict(meta, full_path="/api/v1/bibliotheque/emprunts/{emprunt}/prolonger", name="bibliotheque.emprunt.prolonger")),
+        EndpointRow(side="client", method="POST", path="/api/v1/bibliotheque/emprunts", normalized_path="/api/v1/bibliotheque/emprunts",
+                    handler="createEmprunt", framework="axios", line=12),
+    ])
+    sw = db.replace_file_artifacts(files["swagger"].id, symbols=[SymbolRow(name="EmpruntSwagger", kind="class", line_start=22, line_end=300)])
+    eloquent, migrations = md["models"][0], m1["models"] + m2["models"]
+    db.add_relations([RelationRow(src=node_key("model", eloquent), dst=node_key("model", mid), kind="same_entity",
+                                  meta={"rule": "same_table"}) for mid in migrations])
+    db.add_relations([
+        RelationRow(src=node_key("file", files["controller"].id), dst=node_key("model", eloquent), kind="uses_model", meta={"rule": "import"}),
+        RelationRow(src=node_key("endpoint", rt["endpoints"][1]), dst=node_key("symbol", ctl["symbols"][3]), kind="handles"),
+        RelationRow(src=node_key("endpoint", rt["endpoints"][0]), dst=node_key("symbol", ctl["symbols"][2]), kind="handles"),
+    ])
+    return {"files": files, "model_id": eloquent, "migration_ids": migrations, "model_class": md["symbols"][0],
+            "request_class": rq["symbols"][0], "controller_class": ctl["symbols"][0], "store_method": ctl["symbols"][3],
+            "post_endpoint": rt["endpoints"][1], "get_endpoint": rt["endpoints"][0], "client_endpoint": rt["endpoints"][5],
+            "swagger_class": sw["symbols"][0], "model_lines": model_lines}
+
+
+def emprunt_hits(g: Dict[str, Any]) -> Dict[str, Hit]:
+    """Hits au format du moteur pour l'entité ``seed_emprunt`` (modèle, migration, classe, fichier, méthode, route)."""
+    files = g["files"]
+    return {
+        "model": Hit(source_type="model", source_id=g["model_id"], title="Emprunt (table emprunts)", path=files["model"].path,
+                     repo_id="biblio", file_id=files["model"].id, line_start=11, line_end=41, score=0.9, channels=["identifier"],
+                     reason="mots collés « Emprunt »", text="\n".join(g["model_lines"][10:41]),
+                     extra={"model_id": g["model_id"], "kind": "eloquent", "table_name": "emprunts"}),
+        "migration": Hit(source_type="model", source_id=g["migration_ids"][0], title="emprunts", path=files["mig1"].path,
+                         repo_id="biblio", file_id=files["mig1"].id, line_start=11, line_end=28, score=0.5, channels=["graph"],
+                         reason="relié à Emprunt via same_entity", text="Schema::create('emprunts', function (Blueprint $table) {",
+                         extra={"model_id": g["migration_ids"][0], "kind": "migration", "table_name": "emprunts"}),
+        "class": Hit(source_type="symbol", source_id=g["model_class"], title="Emprunt", path=files["model"].path, repo_id="biblio",
+                     file_id=files["model"].id, line_start=11, line_end=41, score=0.6, channels=["identifier"],
+                     reason="mots collés « Emprunt »", text="\n".join(g["model_lines"][10:41]),
+                     extra={"symbol_id": g["model_class"], "kind": "class", "signature": "class Emprunt extends Model"}),
+        "model_file": Hit(chunk_id=1, source_type="file", source_id=files["model"].id, title="Emprunt.php", path=files["model"].path,
+                          repo_id="biblio", file_id=files["model"].id, line_start=1, line_end=41, score=0.4, channels=["lexical"],
+                          reason="correspondance lexicale sur « emprunt »", text="\n".join(g["model_lines"]), extra={"language": "php"}),
+        "store": Hit(source_type="symbol", source_id=g["store_method"], title="EmpruntController::store", path=files["controller"].path,
+                     repo_id="biblio", file_id=files["controller"].id, line_start=48, line_end=53, score=0.3, channels=["graph"],
+                     reason="relié à Emprunt via utilisation du modèle",
+                     text="    public function store(StoreEmpruntRequest $request): JsonResponse\n    {\n        return $this->service->create($request->validated());\n    }",
+                     extra={"symbol_id": g["store_method"], "kind": "method", "parent": "EmpruntController"}),
+        "post": Hit(source_type="endpoint", source_id=g["post_endpoint"], title="POST /emprunts", path=files["routes"].path, repo_id="biblio",
+                    file_id=files["routes"].id, line_start=81, line_end=83, score=0.7, channels=["identifier"], reason="route POST /emprunts",
+                    text="    Route::apiResource('emprunts', EmpruntController::class);",
+                    extra={"endpoint_id": g["post_endpoint"], "side": "server", "method": "POST", "route": "/emprunts",
+                           "handler": "EmpruntController@store"}),
+        "controller": Hit(source_type="symbol", source_id=g["controller_class"], title="EmpruntController", path=files["controller"].path,
+                          repo_id="biblio", file_id=files["controller"].id, line_start=16, line_end=82, score=0.65, channels=["identifier"],
+                          reason="nom de symbole exact", text="class EmpruntController extends Controller\n{\n}",
+                          extra={"symbol_id": g["controller_class"], "kind": "class"}),
+        "client": Hit(source_type="endpoint", source_id=g["client_endpoint"], title="POST /api/v1/bibliotheque/emprunts", path="src/api.ts",
+                      repo_id="biblio", file_id=None, line_start=12, line_end=14, score=0.2, channels=["identifier"], reason="appel client",
+                      text="axios.post('/api/v1/bibliotheque/emprunts', data)", extra={"endpoint_id": g["client_endpoint"], "side": "client"}),
+    }
+
+
+def test_build_cards_model_card_merges_migrations_routes_and_validation(db: Database, tmp_path: Path):
+    g = seed_emprunt(db, tmp_path)
+    h = emprunt_hits(g)
+    # modèle + migration + classe du modèle + fichier du modèle : une seule fiche, celle de l'entité
+    cards = build_cards(db, [h["model"], h["migration"], h["class"], h["model_file"]])
+    assert len(cards) == 1 and cards[0].kind == "model" and cards[0].title == "Modèle Emprunt"
+    text = cards[0].text
+    assert text.startswith("Modèle Emprunt (table emprunts, bibliotheque/app/Models/Emprunt.php:11)\n· champs : ")
+    # types / nullable / défaut / énumération viennent des migrations (up() de la plus récente, jamais son down())
+    assert "livre_id (uuid, requis)" in text and "date_fin (date, nullable)" in text and "commentaire (text, nullable)" in text
+    assert "status (enum A RENDRE|RENDU, requis, défaut A RENDRE)" in text
+    assert "motif (enum Retour anticipé|Perte déclarée, nullable)" in text and "motif (string" not in text
+    assert "· autres colonnes (migrations) : id, created_at" in text
+    assert "· relations : belongs_to Livre (livre)" in text
+    assert "· migrations : 2026_02_04_create_emprunts_table.php, 2026_03_11_update_emprunt_motif_to_enum.php" in text
+    # routes : préfixe commun factorisé, contrôleur répété seulement quand il change, ordre GET/POST/PUT/DELETE
+    assert ("· routes : (préfixe /api/v1/bibliotheque) GET /emprunts → EmpruntController@index, POST /emprunts → @store, "
+            "PUT /emprunts/{emprunt} → @update, DELETE /emprunts/{emprunt} → @destroy, POST /emprunts/{emprunt}/prolonger → @prolongerEmprunt") in text
+    # validation : rules() lu sur le disque, compacté, closures signalées
+    assert ("· validation (création) : StoreEmpruntRequest (bibliotheque/app/Http/Requests/StoreEmpruntRequest.php:28) rules() : "
+            "adherent_id : required|uuid|(closure) ; date_emprunt : required|date ; agence_id : required|uuid ; "
+            "motif : nullable|Rule::in(Emprunt::MOTIFS) ; prolongation : nullable|string|max:255 ; "
+            "status : sometimes|string|in:A RENDRE,RENDU ; date_debut : required|date ; "
+            "exemplaire_id : required|uuid|(closure)") in text  # tableau multi-lignes recollé, message d'erreur de closure ignoré
+    assert "UpdateEmpruntRequest" not in text  # classe absente de l'index : pas inventée
+    assert "· documentation Swagger : bibliotheque/Documentation/Swagger/EmpruntSwagger.php" in text
+    assert cards[0].tokens == estimate_tokens(text) <= 350
+    # ce que la fiche couvre : le modèle, ses migrations, sa classe, ses routes affichées et les morceaux bruts de leurs fichiers
+    routes = {("endpoint", e.id) for e in db.list_endpoints(side="server") if (e.handler or "").startswith("EmpruntController@")}
+    assert cards[0].covers == {("model", g["model_id"])} | {("model", m) for m in g["migration_ids"]} | {("symbol", g["model_class"])} | routes
+    assert cards[0].file_ids == {g["files"]["model"].id, g["files"]["mig1"].id, g["files"]["mig2"].id}
+    # la même fiche part d'un hit de migration (l'entité est retrouvée via same_entity) ou de la classe du modèle
+    assert build_cards(db, [h["migration"]])[0].text == text and build_cards(db, [h["class"]])[0].text == text
+    # jamais plus de max_cards, jamais de fiche pour un fichier ou un document
+    assert build_cards(db, [h["model_file"], doc_hit(), note_hit()]) == [] and build_cards(db, [h["model"]], max_cards=0) == []
+
+
+def test_build_context_puts_cards_first_and_dedupes_covered_passages(db: Database, tmp_path: Path):
+    g = seed_emprunt(db, tmp_path)
+    h = emprunt_hits(g)
+    hits = [h["model"], h["migration"], h["class"], h["model_file"], h["store"], doc_hit(score=0.25)]
+    pack = build_context(hits, 1200, "howto", db=db)
+    # la fiche est S1, en tête, section « Fiches » puis « Passages » ; les passages couverts ne sont pas répétés
+    assert [s.ref for s in pack.sources] == ["S1", "S2", "S3"] and len(pack.cards) == 1 and pack.cards[0].ref == "S1"
+    assert pack.text.startswith("Fiches (synthèse exacte de l'index : champs, règles de validation, routes) :\n\n[S1] Modèle Emprunt (table emprunts")
+    assert "\n\nPassages :\n\n[S2] " in pack.text and pack.text.count("[S1]") == 1
+    s1 = pack.sources[0]
+    assert s1.source_type == "model" and s1.model_id == g["model_id"] and s1.path == "app/Models/Emprunt.php" and s1.line_start == 11
+    assert s1.reason == "fiche structurée (synthèse de l'index)" and s1.channels == ["card"] and s1.file_id == g["files"]["model"].id
+    assert [s.source_type for s in pack.sources[1:]] == ["symbol", "document"] and pack.sources[1].symbol_id == g["store_method"]
+    assert pack.hits_by_ref["S1"].extra["card"] == "model" and pack.blocks["S1"] == "[S1] " + pack.cards[0].text
+    assert "StoreEmpruntRequest" in pack.text and "livre_id (uuid, requis)" in pack.text and "POST /emprunts → @store" in pack.text
+    assert pack.tokens_used <= 1200 and pack.truncated == []
+    assert pack.sources == [Source.from_hit("S1", pack.hits_by_ref["S1"])] + pack.sources[1:]  # sérialisable comme les autres
+    # recherche seule : la fiche est listée comme une source ordinaire
+    assert "- [S1] app/Models/Emprunt.php:L11 — fiche structurée (synthèse de l'index)" in render_sources_as_text(pack)
+    # sans base : comportement d'origine, aucune fiche ; fiches fournies : utilisées telles quelles
+    plain = build_context(hits, 1200, "howto")
+    assert plain.cards == [] and not plain.text.startswith("Fiches") and plain.sources[0].source_type == "model"
+    given = build_context(hits, 1200, "howto", cards=pack.cards)
+    assert given.text == pack.text
+    # budget trop petit pour la fiche entière : elle est écartée en bloc, les passages reprennent la place
+    small = build_context(hits, 150, "howto", db=db)
+    assert small.cards == [] and small.sources and small.tokens_used <= 150 and not small.text.startswith("Fiches")
+    # plusieurs fiches : elles ne prennent jamais plus des deux tiers du budget (la première passe toujours)
+    big_card, small_card = pack.cards[0], build_cards(db, [h["controller"]])[0]
+    many = build_context(hits, 600, "howto", cards=[big_card, small_card, small_card])
+    assert [c.title for c in many.cards] == ["Modèle Emprunt"] and many.sources[1].source_type != "model"
+    assert [c.title for c in build_context(hits, 1500, "howto", cards=[big_card, small_card]).cards] == ["Modèle Emprunt", "Classe EmpruntController"]
+    # les outils ajoutent après les fiches, sans doublon de ce que la fiche couvre (modèle, route affichée)
+    added = add_tool_sources(pack, [h["model"], h["post"], h["controller"]], 500)
+    assert [s.ref for s in added] == ["S4"] and added[0].source_type == "symbol" and added[0].symbol_id == g["controller_class"]
+
+
+def test_build_context_keeps_one_passage_per_identical_span():
+    # plusieurs routes déclarées sur la même ligne (apiResource) donnent des hits distincts au texte identique
+    hits = [file_hit(source_type="endpoint", source_id=i, chunk_id=None, title="GET /orders", path="routes/web.php", line_start=7,
+                     line_end=9, text="Route::resource('orders', OrderController::class);", extra={"endpoint_id": i})
+            for i in range(1, 5)]
+    hits.append(file_hit(source_type="endpoint", source_id=9, chunk_id=None, path="routes/web.php", line_start=7, line_end=9,
+                         text="Route::get('/orders/export', [OrderController::class, 'export']);", extra={"endpoint_id": 9}))
+    pack = build_context(hits, 800)
+    assert [s.endpoint_id for s in pack.sources] == [1, 9] and pack.truncated == []
+
+
+def test_build_cards_endpoint_and_class_cards(db: Database, tmp_path: Path, monkeypatch):
+    g = seed_emprunt(db, tmp_path)
+    h = emprunt_hits(g)
+    cards = build_cards(db, [h["post"], h["controller"], h["client"]])
+    assert [c.kind for c in cards] == ["endpoint", "symbol"]  # un appel client n'a pas de fiche
+    ep = cards[0].text
+    assert ep.startswith("Route POST /emprunts (bibliotheque/routes/api.php:81) → EmpruntController@store · chemin complet : /api/v1/bibliotheque/emprunts"
+                         " · nom : emprunts.store · middleware : auth:api, verified")
+    assert "· contrôleur : store(StoreEmpruntRequest $request): JsonResponse (bibliotheque/app/Http/Controllers/Api/V1/EmpruntController.php:48-53)" in ep
+    assert "· classe de requête : StoreEmpruntRequest (bibliotheque/app/Http/Requests/StoreEmpruntRequest.php:28) rules() : adherent_id : required|uuid|(closure)" in ep
+    assert "· modèle principal : Emprunt (table emprunts, bibliotheque/app/Models/Emprunt.php:11) — champs : livre_id (uuid, requis), status (enum" in ep
+    assert "· documentation Swagger : bibliotheque/Documentation/Swagger/EmpruntSwagger.php" in ep
+    assert cards[0].covers == {("endpoint", g["post_endpoint"])} and cards[0].source is None and cards[0].hit.extra["endpoint_id"] == g["post_endpoint"]
+    cls = cards[1].text
+    assert cls.startswith("Classe EmpruntController (bibliotheque/app/Http/Controllers/Api/V1/EmpruntController.php:16-82) — class EmpruntController extends Controller")
+    assert "· parent : Controller" in cls
+    assert ("· méthodes publiques (4) : __construct(EmpruntService $service) L18 ; index(Request $request): JsonResponse L35 ; "
+            "store(StoreEmpruntRequest $request): JsonResponse L48 ; update(Emprunt $emprunt, UpdateEmpruntRequest $request): JsonResponse L55") in cls
+    assert "guard" not in cls  # méthode privée
+    assert all(estimate_tokens(c.text) <= 350 for c in cards)
+    # une classe de requête vue comme symbole : ses règles sont dans la fiche
+    rq_hit = Hit(source_type="symbol", source_id=g["request_class"], title="StoreEmpruntRequest", path=g["files"]["request"].path,
+                 repo_id="biblio", file_id=g["files"]["request"].id, line_start=11, line_end=55, score=0.5, channels=["identifier"],
+                 text="class StoreEmpruntRequest extends FormRequest", extra={"symbol_id": g["request_class"], "kind": "class"})
+    rq_card = build_cards(db, [rq_hit])[0]
+    assert rq_card.text.startswith("Classe StoreEmpruntRequest (bibliotheque/app/Http/Requests/StoreEmpruntRequest.php:11-55)")
+    assert "· règles de validation (rules(), bibliotheque/app/Http/Requests/StoreEmpruntRequest.php:28) : adherent_id : required|uuid|(closure) ;" in rq_card.text
+    assert "prepareForValidation" not in rq_card.text and "authorize(): bool L15" in rq_card.text
+    # une route listée sur la fiche du modèle n'a pas de fiche à elle, quel que soit l'ordre des hits ;
+    # une seule fiche de route par contrôleur
+    assert [c.kind for c in build_cards(db, [h["model"], h["post"], h["post"]])] == ["model"]
+    assert [c.kind for c in build_cards(db, [h["post"], h["class"], h["model"]])] == ["model"]
+    get_hit = Hit(source_type="endpoint", source_id=g["get_endpoint"], title="GET /emprunts", path="routes/api.php",
+                  file_id=g["files"]["routes"].id, text="Route::get", extra={"endpoint_id": g["get_endpoint"]})
+    assert [c.title for c in build_cards(db, [h["post"], get_hit])] == ["Route POST /emprunts"]
+    # route hors des routes affichées de la fiche du modèle : fiche de route sans répéter champs ni règles,
+    # et la fiche du modèle passe devant même si la route était le premier hit
+    monkeypatch.setattr("develop.chat.context_builder.CARD_MAX_ROUTES", 1)
+    both = build_cards(db, [h["post"], h["model"]])
+    assert [c.kind for c in both] == ["model", "endpoint"] and "GET /emprunts → EmpruntController@index, … (+4)" in both[0].text
+    assert "· modèle principal : Emprunt (champs : voir sa fiche)" in both[1].text
+    assert "· classe de requête : StoreEmpruntRequest (règles : voir la fiche du modèle)" in both[1].text
+    assert "adherent_id" not in both[1].text and "livre_id" not in both[1].text
+    monkeypatch.setattr("develop.chat.context_builder.CARD_MAX_ROUTES", 8)
+    # route sans relation handles ni classe de requête dans la signature : convention Store<Modèle>Request, méthode retrouvée par le handler
+    db.delete_relations_touching([node_key("endpoint", g["get_endpoint"])])
+    get_card = build_cards(db, [Hit(source_type="endpoint", source_id=g["get_endpoint"], title="GET /emprunts", path="routes/api.php",
+                                    file_id=g["files"]["routes"].id, text="Route::get", extra={"endpoint_id": g["get_endpoint"]})])[0]
+    assert "· contrôleur : index(Request $request): JsonResponse (bibliotheque/app/Http/Controllers/Api/V1/EmpruntController.php:35-40)" in get_card.text
+    assert "classe de requête" not in get_card.text and "· modèle principal : Emprunt (table emprunts" in get_card.text
+
+
+def test_card_paths_carry_the_repo_name_like_passage_headers(db: Database, tmp_path: Path):
+    """Les fiches citent « dépôt/chemin », le libellé de l'en-tête des passages (:func:`format_header`) : sur un projet
+    découpé en modules (un dépôt indexé par module), « app/Models/Emprunt.php » n'existe pas à la racine du projet et
+    deux modules ont chacun leur ``routes/api.php`` ; le préfixe rend chaque citation résoluble et non ambiguë."""
+    root = tmp_path / "Modules" / "Bibliotheque"
+    g = seed_emprunt(db, root)
+    db.upsert_repo(RepoRow(id="biblio", name="Modules/Bibliotheque", path=str(root), kind="backend"))
+    db.upsert_repo(RepoRow(id="sec", name="Modules/Securite", path=str(tmp_path / "Modules" / "Securite"), kind="backend"))
+    user = FileRow(repo_id="sec", path="app/Models/User.php", language="php", kind="code")
+    routes = FileRow(repo_id="sec", path="routes/api.php", language="php", kind="code")  # même chemin relatif que dans Bibliotheque
+    for f in (user, routes):
+        db.upsert_file(f)
+    um = db.replace_file_artifacts(user.id, models=[ModelRow(name="User", table_name="users", kind="eloquent", line=42,
+                                                           fields=[{"name": "email", "type": "string"}])])["models"][0]
+    login = db.replace_file_artifacts(routes.id, endpoints=[EndpointRow(
+        side="server", method="POST", path="/login", normalized_path="/api/login", handler="AuthController@login",
+        framework="laravel", line=11)])["endpoints"][0]
+    h = emprunt_hits(g)
+    model_card = build_cards(db, [h["model"]])[0].text
+    assert model_card.startswith("Modèle Emprunt (table emprunts, Modules/Bibliotheque/app/Models/Emprunt.php:11)\n")
+    assert "· validation (création) : StoreEmpruntRequest (Modules/Bibliotheque/app/Http/Requests/StoreEmpruntRequest.php:28) rules()" in model_card
+    assert "· documentation Swagger : Modules/Bibliotheque/Documentation/Swagger/EmpruntSwagger.php" in model_card
+    route_card = build_cards(db, [h["post"]])[0].text
+    assert route_card.startswith("Route POST /emprunts (Modules/Bibliotheque/routes/api.php:81) → EmpruntController@store")
+    assert "(Modules/Bibliotheque/app/Http/Controllers/Api/V1/EmpruntController.php:48-53)" in route_card
+    assert "· modèle principal : Emprunt (table emprunts, Modules/Bibliotheque/app/Models/Emprunt.php:11) — champs" in route_card
+    assert build_cards(db, [h["controller"]])[0].text.startswith(
+        "Classe EmpruntController (Modules/Bibliotheque/app/Http/Controllers/Api/V1/EmpruntController.php:16-82)")
+    # l'autre module : son routes/api.php et son modèle se distinguent par leur préfixe
+    user_hit = Hit(source_type="model", source_id=um, title="User", path=user.path, repo_id="sec", file_id=user.id, line_start=42,
+                   text="class User", extra={"model_id": um, "kind": "eloquent"})
+    login_hit = Hit(source_type="endpoint", source_id=login, title="POST /login", path=routes.path, repo_id="sec", file_id=routes.id,
+                    line_start=11, text="Route::post", extra={"endpoint_id": login, "handler": "AuthController@login"})
+    cards = build_cards(db, [user_hit, login_hit])
+    assert cards[0].text.startswith("Modèle User (table users, Modules/Securite/app/Models/User.php:42)\n· champs : email")
+    assert cards[1].text.startswith("Route POST /login (Modules/Securite/routes/api.php:11) → AuthController@login")
+    # même libellé que l'en-tête d'un passage du même fichier ; le hit d'une fiche porte repo_name comme ceux du moteur,
+    # sa source garde le chemin relatif au dépôt
+    passage = Hit(**dict(h["model_file"].__dict__, extra={"language": "php", "repo_name": "Modules/Bibliotheque"}))
+    assert format_header("S3", passage).startswith("[S3] Modules/Bibliotheque/app/Models/Emprunt.php:L1-41")
+    assert _repo_prefix(cards[0].hit) == "Modules/Securite" and cards[0].hit.path == "app/Models/User.php"
+    loader = _CardLoader(db)
+    assert loader.where(user.id) == "Modules/Securite/app/Models/User.php" and loader.path(user.id) == "app/Models/User.php"
+    assert loader.where(None) == "" and loader.where(10_000) == ""
+
+
+def test_cards_read_rules_from_index_when_disk_is_unavailable_and_stay_under_350_tokens(db: Database, tmp_path: Path):
+    g = seed_emprunt(db, tmp_path, write_request=False)  # fichier absent du disque : repli sur les morceaux indexés
+    h = emprunt_hits(g)
+    card = build_cards(db, [h["model"]])[0]
+    assert "rules() : adherent_id : required|uuid|(closure) ; date_emprunt : required|date" in card.text
+    # fichier hors du dépôt : jamais lu, règles « non lues » signalées plutôt qu'inventées
+    evil = FileRow(repo_id="biblio", path="../../../etc/EvilRequest.php", language="php", kind="code")
+    db.upsert_file(evil)
+    ev = db.replace_file_artifacts(evil.id, symbols=[
+        SymbolRow(name="StoreEvilRequest", kind="class", line_start=1, line_end=20),
+        SymbolRow(name="rules", kind="method", parent="StoreEvilRequest", line_start=5, line_end=15, meta={"visibility": "public"})])
+    evil_hit = Hit(source_type="symbol", source_id=ev["symbols"][0], title="StoreEvilRequest", path=evil.path, file_id=evil.id,
+                   line_start=1, line_end=20, text="class StoreEvilRequest", extra={"symbol_id": ev["symbols"][0], "kind": "class"})
+    assert "rules(), bibliotheque/../../../etc/EvilRequest.php:5) : non lues (ouvrir le fichier)" in build_cards(db, [evil_hit])[0].text
+    # modèle énorme (80 champs, 30 relations, 40 routes) : la fiche reste ≤ 350 tokens, les champs d'abord
+    big = FileRow(repo_id="biblio", path="app/Models/Claim.php", language="php", kind="code")
+    db.upsert_file(big)
+    bm = db.replace_file_artifacts(big.id, models=[ModelRow(name="Claim", table_name="claims", kind="eloquent", line=9,
+                                                            fields=[{"name": "champ_numero_%02d" % i, "type": "string", "nullable": False} for i in range(80)],
+                                                            relations=[{"kind": "belongs_to", "target": "Cible%d" % i, "field": "cible%d" % i} for i in range(30)])])
+    routes = FileRow(repo_id="biblio", path="routes/claims.php", language="php", kind="code")
+    db.upsert_file(routes)
+    db.replace_file_artifacts(routes.id, endpoints=[EndpointRow(side="server", method="GET", path="/claims/variante-%02d/{id}" % i,
+                                                               normalized_path="/claims/variante-%02d/:param" % i,
+                                                               handler="ClaimController@variante%d" % i, framework="laravel", line=i + 1)
+                                                   for i in range(40)])
+    big_hit = Hit(source_type="model", source_id=bm["models"][0], title="Claim", path=big.path, file_id=big.id, line_start=9,
+                  text="class Claim", extra={"model_id": bm["models"][0], "kind": "eloquent"})
+    big_card = build_cards(db, [big_hit])[0]
+    assert estimate_tokens(big_card.text) <= 350 and big_card.tokens <= 350
+    assert big_card.text.startswith("Modèle Claim (table claims, bibliotheque/app/Models/Claim.php:9)\n· champs : champ_numero_00 (string, requis)")
+    fields_line = big_card.text.splitlines()[1]
+    assert fields_line.endswith("…") and len(fields_line) <= 702 and "champ_numero_79" not in fields_line  # ligne bornée, jamais coupée en mots
+    assert "· routes : " in big_card.text and big_card.text.endswith("… (+32)")  # 8 routes montrées, le reste compté
+    pack = build_context([big_hit], 400, "fields", db=db)
+    assert pack.cards and pack.tokens_used <= 400
+
+
+def test_model_card_shortens_routes_before_dropping_validation_rules(db: Database, tmp_path: Path):
+    # Régression : une fiche de modèle qui débordait de CARD_MAX_TOKENS retirait d'un bloc la section « validation
+    # (création) » (priorité 3) en gardant ses 8 routes (priorité 2) ; sur un index réel, 7 des 39 modèles ayant un
+    # Store<Modèle>Request::rules() n'affichaient aucune règle — précisément la
+    # « définition des champs » demandée. Désormais une section est raccourcie (variante suivante) avant d'être
+    # retirée, les règles de création passent avant les routes, et la place restante revient par priorité.
+    header = "Modèle X (app/Models/X.php:1)"
+    champs = "champs : " + "a" * 400
+    routes = ["routes : " + "r" * 400, "routes : " + "r" * 200 + ", … (+4)", "routes : " + "r" * 100 + ", … (+6)"]
+    rules = ["validation (création) : " + "v" * 400, "validation (création) : " + "v" * 200 + " ; … (+5)"]
+    policy = "policy : XPolicy (app/Policies/XPolicy.php:9)"
+    sections = [(1, champs), (3, routes), (2, rules), (8, policy)]
+    assert _fit_sections(header, sections, 10_000) == "\n".join([header, "· " + champs, "· " + routes[0], "· " + rules[0], "· " + policy])
+    # 300 tokens : les routes se raccourcissent (les règles, plus prioritaires, restent entières) et la policy,
+    # retirée en premier, revient dans la place ainsi libérée
+    at300 = _fit_sections(header, sections, 300)
+    assert at300 == "\n".join([header, "· " + champs, "· " + routes[1], "· " + rules[0], "· " + policy]) and estimate_tokens(at300) <= 300
+    # 200 tokens : les règles se raccourcissent plutôt que de disparaître, et deux routes reviennent après elles
+    at200 = _fit_sections(header, sections, 200)
+    assert at200 == "\n".join([header, "· " + champs, "· " + routes[2], "· " + rules[1]]) and estimate_tokens(at200) <= 200
+    assert _fit_sections(header, [(1, ["même", "même", ""]), (2, [])], 10_000) == header + "\n· même"  # variantes inutiles ignorées
+    # entité Laravel réelle : 20 champs typés, 12 routes, 14 règles de création — la fiche entière dépasse 350 tokens
+    db.upsert_repo(RepoRow(id="biblio", name="bibliotheque", path=str(tmp_path), kind="backend"))
+    model = FileRow(repo_id="biblio", path="app/Models/Dossier.php", language="php", kind="code")
+    routes_file = FileRow(repo_id="biblio", path="routes/dossiers.php", language="php", kind="code")
+    request = FileRow(repo_id="biblio", path="app/Http/Requests/StoreDossierRequest.php", language="php", kind="code")
+    for f in (model, routes_file, request):
+        db.upsert_file(f)
+    dm = db.replace_file_artifacts(model.id, models=[ModelRow(
+        name="Dossier", table_name="dossiers", kind="eloquent", line=9,
+        fields=[{"name": "champ_%02d" % i, "type": "string", "nullable": False} for i in range(20)])])
+    rt = db.replace_file_artifacts(routes_file.id, endpoints=[
+        EndpointRow(side="server", method="GET", path="/dossiers/variante-%02d/{id}" % i, normalized_path="/dossiers/variante-%02d/:param" % i,
+                    handler="DossierController@variante%d" % i, framework="laravel", line=i + 1) for i in range(12)])
+    body = (["    public function rules(): array", "    {", "        return ["]
+            + ["            'champ_%02d' => 'required|string|max:255'," % i for i in range(14)] + ["        ];", "    }"])
+    db.replace_file_artifacts(request.id, symbols=[
+        SymbolRow(name="StoreDossierRequest", kind="class", line_start=3, line_end=30),
+        SymbolRow(name="rules", kind="method", parent="StoreDossierRequest", line_start=6, line_end=5 + len(body), meta={"visibility": "public"})])
+    target = tmp_path / "app" / "Http" / "Requests" / "StoreDossierRequest.php"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(php_lines(30, {3: ["class StoreDossierRequest extends FormRequest", "{"], 6: body})) + "\n", encoding="utf-8")
+    # les variantes des règles gardent des entrées entières et comptent le reste, jamais de coupe au milieu d'une règle
+    variants = _request_section(_CardLoader(db), "StoreDossierRequest", "validation (création)")
+    prefix = "validation (création) : StoreDossierRequest (bibliotheque/app/Http/Requests/StoreDossierRequest.php:6) rules() : champ_00 : required|string|max:255 ; "
+    assert [v.startswith(prefix) for v in variants] == [True, True, True]
+    assert variants[0].endswith("champ_13 : required|string|max:255") and variants[1].endswith("champ_07 : required|string|max:255 ; … (+6)")
+    assert variants[2].endswith("champ_04 : required|string|max:255 ; … (+9)")
+    hit = Hit(source_type="model", source_id=dm["models"][0], title="Dossier", path=model.path, file_id=model.id, line_start=9,
+              text="class Dossier", extra={"model_id": dm["models"][0], "kind": "eloquent"})
+    card = build_cards(db, [hit])[0]
+    assert card.tokens == estimate_tokens(card.text) <= 350
+    lines = card.text.splitlines()
+    assert lines[0] == "Modèle Dossier (table dossiers, bibliotheque/app/Models/Dossier.php:9)" and lines[1].startswith("· champs : champ_00 (string, requis), ")
+    assert "champ_19 (string, requis)" in lines[1]
+    assert lines[2] == "· routes : GET /dossiers/variante-00/{id} → DossierController@variante0, GET /dossiers/variante-01/{id} → @variante1, … (+10)"
+    assert lines[3] == "· " + variants[0]  # les 14 règles, entières, avant les routes raccourcies
+    assert len(lines) == 4
+    # seules les routes affichées sont couvertes par la fiche : les autres restent des passages citables
+    assert card.covers == {("model", dm["models"][0]), ("endpoint", rt["endpoints"][0]), ("endpoint", rt["endpoints"][1])}
+
+
+LONG_QUESTION = ("Comment OrderService::confirm vérifie-t-il le statut draft avant de passer en confirmed, renseigner confirmed_at, "
+                 "notifier le client, journaliser la décision et déclencher la facture ?")
+
+
+def test_followup_terms_come_from_previous_question_and_sources():
+    previous = "que dit le document paramétrage des formulaires"
+    sources = [{"path": "public/documentation/specification-formulaires-commandes.pdf"}, {"title": "Paramétrage des formulaires de commande"},
+               {"path": "scripts/documentation/contenu_configuration.py"}, {"path": "app/Models/Ignored.php"}]
+    terms = followup_terms("explique moi la définition des champs avec exemple", previous, sources)
+    # identifiants, titre du document (3 premières sources) puis mots-clés ≥ 4 lettres ; un nom de fichier composé
+    # (« contenu_configuration », « specification-formulaires-commandes ») n'est jamais un terme : FTS5 le cherche comme une
+    # phrase exacte que seul ce fichier contient et le canal lexical (tous les termes exigés) se réduirait à lui
+    assert terms == ["Paramétrage des formulaires de commande", "paramétrage", "formulaires"]
+    assert "dit" not in terms and "Ignored" not in terms
+    # un nom nu de classe reste un terme (« Emprunt »), pas un nom générique (« api » de routes/api.php)
+    terms = followup_terms("et ses champs ?", "décris-moi ce modèle",
+                           [{"path": "app/Models/Emprunt.php", "source_type": "model", "title": "Emprunt"},
+                            {"path": "routes/api.php", "source_type": "endpoint", "title": "POST /emprunts"}])
+    assert terms[0] == "Emprunt" and "api" not in terms
+    assert len(followup_terms("et ?", "Order OrderService OrderController confirm statut commande client facture", [])) <= 8
+    # les termes déjà dans la question ne sont pas répétés ; question longue avec identifiant : pas de suivi
+    assert followup_terms("et le document paramétrage des formulaires ?", previous, []) == []
+    assert followup_terms("et le document paramétrage ?", previous, [])[-1] == "formulaires"
+    assert followup_terms(LONG_QUESTION, previous, sources) == []
+    assert followup_terms("et les champs ?", "", sources) == [] and followup_terms("et les champs ?", "bonjour", []) == []
+
+
+def test_followup_needs_an_opener_or_a_missing_subject():
+    """Régression : une question n'était autonome qu'avec ≥ 8 mots-clés ET un identifiant, donc presque toute question
+    française était un « suivi » et héritait des termes du tour précédent. Sur l'index réel, après « que dit le document
+    paramétrage des formulaires », « quel est l'api d'authentification et un exemple d'appel » perdait toutes ses sources
+    d'authentification (top 5 = contenu_configuration.py, GET /commandes, POST /commandes, le PDF du paramétrage). Désormais une
+    question est un suivi seulement si elle s'ouvre sur un mot de liaison ou ne nomme aucun sujet à elle (ni identifiant,
+    chemin, route ou table, ni mot-clé autre qu'un mot d'aspect : champs, validation, définition…)."""
+    from develop.chat.orchestrator import FOLLOWUP_ASPECT_WORDS, FOLLOWUP_OPENERS, is_followup_question
+    previous = "que dit le document paramétrage des formulaires"
+    sources = [{"path": "public/documentation/specification-formulaires-commandes.pdf"}, {"path": "scripts/documentation/contenu_configuration.py"}]
+    # une question qui nomme son sujet est autonome, même courte et sans identifiant
+    for text in ("quel est l'api d'authentification et un exemple d'appel", "comment confirmer une commande via l'api ?",
+                 "comment fonctionne le paramétrage", "qui appelle OrderService::confirm ?", "peux-tu me décrire le modèle User",
+                 "quels champs a la table orders ?", "ouvre OrderService.php", "quelle est l'api pour rechercher un client ?",
+                 "comment est calculé le montant total d'une commande ?", LONG_QUESTION):
+        assert not is_followup_question(text), text
+        assert followup_terms(text, previous, sources) == [], text
+    # mot de liaison en tête, ou aucun sujet à elle (mots d'aspect seulement, pronoms) : suivi
+    for text in ("et les champs ?", "Et ses commandes ?", "ok mais pourquoi ?", "et ?", "d'accord, et la validation ?",
+                 "explique moi la définition des champs avec exemple", "quelles sont les règles de validation ?",
+                 "montre moi le code", "il sert à quoi ?", "quelles tables sont liées ?", "et pour les utilisateurs ?"):
+        assert is_followup_question(text), text
+        assert followup_terms(text, previous, sources), text
+    assert {"et", "mais", "ok", "donc", "d'accord"} <= FOLLOWUP_OPENERS and {"champs", "validation", "definition"} <= FOLLOWUP_ASPECT_WORDS
+    assert is_followup_question("") and is_followup_question("   ?")  # rien à chercher : le tour précédent fait la question
+    # une analyse déjà calculée est réutilisée telle quelle (pas de seconde analyse)
+    from develop.search.query import analyze_query
+    assert not is_followup_question("quel est l'api d'authentification", analyze_query("quel est l'api d'authentification"))
+    assert is_followup_question("quels sont les champs ?", analyze_query("quels sont les champs ?"))
+
+
+async def test_followup_question_enriches_search_but_not_the_prompt(db: Database, workspace: WorkspaceConfig, seeded):
+    engine = FakeSearchEngine([doc_hit()])
+    llm = FakeLLM([text_chunks("Le document décrit les champs [S1].")])
+    orch = make_orchestrator(db, workspace, llm, engine, model_info=info(32768, tools=False))
+    conv = db.create_conversation()
+    first = await collect(orch, conv, "que dit le document paramétrage des formulaires")
+    assert first[0].data == {"text": "Recherche dans le projet…"}
+    assert engine.calls[0]["query"] == "que dit le document paramétrage des formulaires"  # première question : rien à conserver
+    events = await collect(orch, conv, "explique moi la définition des champs avec exemple")
+    assert types(events) == ["status", "sources", "delta", "done"]
+    status = events[0].data["text"]  # sources de la réponse précédente (titre du document) puis mots-clés de la question
+    assert status.startswith("Question de suivi : contexte « Dictionnaire de données ") and status.endswith("paramétrage formulaires » conservé")
+    context = status[len("Question de suivi : contexte « "):-len(" » conservé")]
+    assert engine.calls[1]["query"] == "explique moi la définition des champs avec exemple [contexte précédent : %s]" % context
+    # le modèle reçoit la question d'origine, sans le marqueur ; le message enregistré aussi
+    user_msg = llm.calls[1]["messages"][-1].content
+    assert user_msg.startswith("explique moi la définition des champs avec exemple\n\n") and "contexte précédent" not in user_msg
+    assert db.get_conversation(conv)["messages"][-2]["content"] == "explique moi la définition des champs avec exemple"
+    # question longue avec identifiants : recherche telle quelle
+    events = await collect(orch, conv, LONG_QUESTION)
+    assert events[0].data == {"text": "Recherche dans le projet…"} and engine.calls[2]["query"] == LONG_QUESTION
+    # recherche seule : jamais enrichie ; après une petite conversation : rien à conserver non plus
+    events = await collect(orch, conv, "et les champs ?", mode="search_only")
+    assert types(events) == ["status", "sources", "done"] and engine.calls[3]["query"] == "et les champs ?"
+    await collect(orch, conv, "merci")
+    events = await collect(orch, conv, "et les champs ?")
+    assert events[0].data == {"text": "Recherche dans le projet…"} and engine.calls[-1]["query"] == "et les champs ?"
+    # les crochets du marqueur sont tolérés par l'analyse : les termes deviennent mots-clés / identifiants
+    from develop.search.query import analyze_query
+    analysis = analyze_query("et les champs ? [contexte précédent : Emprunt StoreEmpruntRequest paramétrage formulaires]")
+    assert {"emprunt", "storeempruntrequest", "paramétrage", "formulaires"} <= set(analysis.keywords)
+    assert "StoreEmpruntRequest" in analysis.identifiers and "contexte" not in analysis.identifiers
+
+
+async def test_smalltalk_answers_without_search_or_llm(db: Database, workspace: WorkspaceConfig, seeded):
+    engine = FakeSearchEngine([file_hit()])
+    llm = FakeLLM([text_chunks("ne doit jamais être appelé")])
+    orch = make_orchestrator(db, workspace, llm, engine, model_info=info(8192, tools=True))
+    conv = db.create_conversation()
+    answers: List[str] = []
+    for text in ("bonjour", "Merci beaucoup !", "ok", "Salut", "ça va ?", "d'accord, merci"):
+        events = await collect(orch, conv, text)
+        assert types(events) == ["status", "sources", "delta", "done"], text
+        assert events[0].data["text"].startswith("Petite conversation") and events[1].data["items"] == []
+        answer = events[2].data["text"]
+        assert "Develop" in answer and "« Boutique »" in answer and "décris-moi le modèle Order" in answer and "GET /orders" in answer
+        done = events[-1].data
+        assert done["message_id"] and done["usage"] == {} and done["budget"]["tools_mode"] == "none" and done["budget"]["num_ctx"] == 8192
+        assert done["invalid_citations"] == [] and done["truncated_sources"] == []
+        answers.append(answer)
+    assert engine.calls == [] and engine.embed_calls == 0 and llm.calls == []
+    assert answers[0].startswith("Bonjour !") and answers[1].startswith("Avec plaisir !") and answers[2].startswith("Très bien.")
+    assert answers[4].startswith("Très bien, merci !")
+    msgs = db.get_conversation(conv)["messages"]
+    assert [m["role"] for m in msgs][-2:] == ["user", "assistant"] and msgs[-1]["content"] == answers[-1] and msgs[-1]["sources"] == []
+    # pas une petite conversation : un terme du projet, une vraie question, plus de trois mots
+    for text in ("bonjour, décris le modèle Order", "merci pour la réponse précédente", "Order", "ok et les champs ?", ""):
+        assert not is_smalltalk(text), text
+    for text in ("Bonjour !", "merci", "MERCI BEAUCOUP", "ok ok", "Ça va", "bonne journée", "non"):
+        assert is_smalltalk(text), text
+    # mode recherche seule inchangé : « bonjour » est cherché comme avant
+    events = await collect(orch, conv, "bonjour", mode="search_only")
+    assert types(events) == ["status", "sources", "done"] and engine.calls[0]["query"] == "bonjour"
+    assert [s["ref"] for s in events[1].data["items"]] == ["S1"]
+    # sans index : exemples génériques, jamais d'erreur
+    with Database(":memory:") as empty:
+        text = smalltalk_reply(empty, "", "bonjour")
+        assert "modèle <Nom>" in text and "POST /<ressource>" in text and "Je suis l'assistant de Develop pour l'espace de travail." in text
+
+
+async def test_short_reply_to_the_model_reaches_it(db: Database, workspace: WorkspaceConfig, seeded):
+    """Régression : « oui », « non », « Non merci », « ok top » étaient absorbés comme petites conversations (réponse
+    générique « Très bien. Je suis l'assistant… ») même quand le modèle venait de poser une question : sa question
+    restait sans réponse et « non » recevait « Très bien. ». Désormais un acquiescement qui suit une question du modèle,
+    et un oui / non dès que le modèle a répondu, lui parviennent (question de suivi, historique compris) ; la question
+    de suivi d'après garde le sujet d'avant le « oui » ; « non » sans rien à contester ouvre sur « Entendu. »."""
+    from develop.chat.orchestrator import (SMALLTALK_ACKS, SMALLTALK_ANSWERS, SMALLTALK_SIGNATURE, asks_a_question,
+                                           is_reply_to_model)
+
+    engine = FakeSearchEngine([file_hit()])
+    question = "Le modèle Order a trois champs [S1]. Voulez-vous le détail des routes ?"
+    llm = FakeLLM([text_chunks(question), text_chunks("Les routes sont GET /orders et POST /orders [S1]."),
+                   text_chunks("La validation est dans StoreOrderRequest [S1]."), text_chunks("Précisez ce qui ne convient pas [S1].")])
+    orch = make_orchestrator(db, workspace, llm, engine, model_info=info(32768, tools=False))
+    conv = db.create_conversation()
+    await collect(orch, conv, "décris-moi le modèle Order")
+    # « oui » répond à la question du modèle : suivi (termes du tour précédent), historique, modèle — pas de réponse générique
+    events = await collect(orch, conv, "oui")
+    status = events[0].data["text"]
+    assert status.startswith("Question de suivi : contexte « ") and "Order" in status, status
+    assert engine.calls[-1]["query"].startswith("oui [contexte précédent : ") and len(llm.calls) == 2
+    sent = llm.calls[-1]["messages"]
+    assert [(m.role, m.content) for m in sent[1:3]] == [("user", "décris-moi le modèle Order"), ("assistant", question)]
+    assert sent[-1].role == "user" and sent[-1].content.startswith("oui\n\n")
+    assert "Les routes sont GET /orders" in db.get_conversation(conv)["messages"][-1]["content"]
+    # la question de suivi d'après garde le sujet : la question précédente est celle d'avant le « oui », pas « oui »
+    events = await collect(orch, conv, "et la validation ?")
+    assert events[0].data["text"].startswith("Question de suivi : contexte « ") and "Order" in events[0].data["text"]
+    assert orch._previous_turn(conv, None)[0] == "et la validation ?"
+    # « non » après une affirmation la conteste : il parvient au modèle ; « ok top » après une affirmation reste une
+    # petite conversation ; « oui » après une réponse de petite conversation (qui n'appelle rien) aussi
+    await collect(orch, conv, "non")
+    assert len(llm.calls) == 4 and llm.calls[-1]["messages"][-1].content.startswith("non\n\n")
+    events = await collect(orch, conv, "ok top")
+    assert events[0].data["text"].startswith("Petite conversation") and events[2].data["text"].startswith("Très bien.")
+    events = await collect(orch, conv, "oui")
+    assert events[0].data["text"].startswith("Petite conversation") and len(llm.calls) == 4
+    assert engine.calls[-1]["query"].startswith("non [contexte précédent : ")  # dernière recherche : celle du « non »
+    # fonctions pures : acquiescement et oui / non après une question du modèle ; politesse inchangée
+    for text in ("oui", "non", "Non merci", "ok top", "bien", "d'accord", "Oui !"):
+        assert is_reply_to_model(text, question) and not is_smalltalk(text, question), text
+    for text in ("bonjour", "merci", "ça va ?", "bonne journée", "merci beaucoup"):
+        assert is_smalltalk(text, question) and not is_reply_to_model(text, question), text
+    statement = "Le modèle Order a trois champs [S1]."
+    assert is_smalltalk("ok top", statement) and is_smalltalk("ok", statement) and is_smalltalk("bien", statement)
+    assert not is_smalltalk("oui", statement) and not is_smalltalk("non", statement) and not is_smalltalk("Non merci", statement)
+    assert is_smalltalk("oui") and is_smalltalk("non") and is_smalltalk("oui", "") and not is_reply_to_model("oui", "")
+    assert not is_reply_to_model("ok mais pourquoi ?", question) and not is_reply_to_model("", question)
+    canned = smalltalk_reply(db, "Boutique", "bonjour")
+    assert SMALLTALK_SIGNATURE in canned and is_smalltalk("oui", canned) and is_smalltalk("ok", canned)
+    assert SMALLTALK_ANSWERS.isdisjoint(SMALLTALK_ACKS) and {"oui", "non", "yes", "no"} <= SMALLTALK_ANSWERS
+    # la question du modèle : dernière ligne finissant par « ? » hors citation, emphase ou guillemets
+    assert asks_a_question("**Voulez-vous le détail ?**") and asks_a_question("Oui.\nVoulez-vous le détail des routes ? [S1]\n")
+    assert asks_a_question("Souhaitez-vous la suite (routes, validation) ?") and not asks_a_question("Fin de la réponse [S1].")
+    assert not asks_a_question("- « qui appelle <fonction> ? » / « quel est l'impact ? »") and not asks_a_question("") and not asks_a_question(canned)
+    # ouverture : une négation n'est pas accueillie par « Très bien. »
+    assert smalltalk_reply(db, "Boutique", "non").startswith("Entendu. Je suis l'assistant de Develop pour l'espace de travail « Boutique ».")
+    assert smalltalk_reply(db, "Boutique", "Non merci").startswith("Entendu.") and smalltalk_reply(db, "Boutique", "ok").startswith("Très bien.")
+    # dernière réponse du modèle : seulement si le dernier message est bien de l'assistant
+    assert orch._previous_answer(conv, None).startswith("Très bien.")
+    db.add_message(conv, "user", "question sans réponse")
+    assert orch._previous_answer(conv, None) == ""
+
+
+def test_system_prompt_tells_the_model_to_use_cards_verbatim():
+    assert "10. Les fiches donnent champs, règles de validation et routes exacts : reprends-les tels quels." in SYSTEM_PROMPT
+    assert "N'invente jamais un champ" in SYSTEM_PROMPT and "quel fichier ouvrir" in SYSTEM_PROMPT  # règles 4 et 5 inchangées
+
+
+# --------------------------------------------------------------------------- intégration recherche ↔ contexte
+
+def test_route_channel_hit_is_a_representative_in_context():
+    """Le canal « route » du moteur a son représentant dans le contexte, comme les autres canaux, dans l'ordre du moteur."""
+    from develop.chat.context_builder import CHANNEL_PRIORITY
+    from develop.search.engine import _CHANNEL_PRIORITY
+    assert CHANNEL_PRIORITY == _CHANNEL_PRIORITY == ("identifier", "route", "graph", "lexical", "semantic", "temporal")
+    body = "\n".join("        ligne %02d : du code pour remplir le budget de contexte ;" % j for j in range(30))
+    hits = [file_hit(chunk_id=10 + i, source_id=10 + i, file_id=10 + i, path="app/Big%d.php" % i, title="Big%d.php" % i,
+                     line_start=1, line_end=30, text=body, score=0.9 - i * 0.01, channels=["lexical"]) for i in range(4)]
+    route = file_hit(chunk_id=None, source_type="endpoint", source_id=5, file_id=50, path="routes/api.php", title="POST /orders/{order}/confirm",
+                     line_start=13, line_end=13, score=0.05, channels=["route"], reason="route contenant « confirm »",
+                     text="Route::post('/orders/{order}/confirm', [OrderController::class, 'confirm']);",
+                     extra={"endpoint_id": 5, "handler": "OrderController@confirm", "language": "php"})
+    big = estimate_tokens(format_block("S1", hits[0]), is_code=True)
+    pack = build_context(hits + [route], big + 80)  # un seul gros passage tient : le second représentant est la route
+    assert [s.source_type for s in pack.sources] == ["file", "endpoint"] and pack.sources[1].endpoint_id == 5
+    assert len(pack.truncated) == 3
+
+
+def test_endpoint_card_uses_the_request_class_resolved_by_the_search_engine(db: Database, tmp_path: Path):
+    """Le canal « route » du moteur résout la classe de validation (``extra.request_class``) ; la fiche de route s'en
+    sert quand la signature du gestionnaire n'en nomme pas, et n'invente rien sans indication."""
+    g = seed_emprunt(db, tmp_path)
+    rq = FileRow(repo_id="biblio", path="app/Http/Requests/IndexEmpruntRequest.php", language="php", kind="code")
+    db.upsert_file(rq)
+    rq_id = db.replace_file_artifacts(rq.id, symbols=[SymbolRow(name="IndexEmpruntRequest", kind="class", line_start=9, line_end=30)])["symbols"][0]
+    base = dict(source_type="endpoint", source_id=g["get_endpoint"], title="GET /emprunts", path="routes/api.php",
+                file_id=g["files"]["routes"].id, text="Route::get", channels=["route"], reason="route contenant « emprunts »")
+    extra = {"endpoint_id": g["get_endpoint"], "handler": "EmpruntController@index", "request_class": "IndexEmpruntRequest",
+             "request_class_id": rq_id, "request_file_id": rq.id}
+    card = build_cards(db, [Hit(extra=extra, **base)])[0]
+    assert "· classe de requête : IndexEmpruntRequest (bibliotheque/app/Http/Requests/IndexEmpruntRequest.php:9)" in card.text
+    plain = build_cards(db, [Hit(extra={"endpoint_id": g["get_endpoint"], "handler": "EmpruntController@index"}, **base)])[0]
+    assert "classe de requête" not in plain.text
+    # la signature du gestionnaire (store(StoreEmpruntRequest …)) prime sur l'indication du moteur
+    post = emprunt_hits(g)["post"]
+    post = Hit(**dict(post.__dict__, extra=dict(post.extra, request_class="App\\Http\\Requests\\AutreRequest")))
+    assert "· classe de requête : StoreEmpruntRequest (bibliotheque/app/Http/Requests/StoreEmpruntRequest.php:28) rules()" in build_cards(db, [post])[0].text
+
+
+def test_model_card_lists_routes_linked_to_the_model_by_the_graph(db: Database, tmp_path: Path):
+    """Le graphe porte désormais ``uses_model`` sur la route elle-même (``endpoint:E`` → ``model:M``) : une route gérée
+    par un autre contrôleur mais reliée au modèle figure sur sa fiche, après les routes de ``<Modèle>Controller``."""
+    g = seed_emprunt(db, tmp_path)
+    routes = FileRow(repo_id="biblio", path="routes/livres.php", language="php", kind="code")
+    db.upsert_file(routes)
+    ep = db.replace_file_artifacts(routes.id, endpoints=[EndpointRow(
+        side="server", method="POST", path="/livres/{livre}/emprunt", normalized_path="/api/v1/bibliotheque/livres/:param/emprunt",
+        handler="LivreController@emprunt", framework="laravel", line=5)])["endpoints"][0]
+    before = build_cards(db, [emprunt_hits(g)["model"]])[0]
+    assert "LivreController@emprunt" not in before.text and ("endpoint", ep) not in before.covers
+    db.add_relations([RelationRow(src=node_key("endpoint", ep), dst=node_key("model", g["model_id"]), kind="uses_model",
+                                  meta={"rule": "handler", "handler": "LivreController@emprunt", "via": "name"})])
+    after = build_cards(db, [emprunt_hits(g)["model"]])[0]
+    line = next(l for l in after.text.splitlines() if l.startswith("· routes : "))
+    assert line.endswith("POST /livres/{livre}/emprunt → LivreController@emprunt")  # après les routes du contrôleur du modèle
+    assert "GET /emprunts → EmpruntController@index, POST /emprunts → @store" in line and ("endpoint", ep) in after.covers
+
+
+async def test_followup_passages_bring_the_requested_section(db: Database, workspace: WorkspaceConfig, seeded):
+    """« explique-moi la définition des champs » après « que dit le document … » : la recherche ne ramène que le
+    sommaire (il contient tous les mots de la question) ; les morceaux du document cité au tour précédent sont
+    relus et la section dont le titre porte le mot-clé (« 4. Les champs… ») passe en tête du contexte."""
+    from develop.chat.orchestrator import followup_passages
+
+    doc_id = db.add_document(DocumentRow(title="Paramétrage des formulaires", format="pdf", kind="upload", sha1="pdf-param"))
+    sommaire = ("Paramétrage des formulaires de commande\nNote — Ce document décrit la définition d'un formulaire de commande et de ses champs.\n"
+                "Sommaire\n1. Vue d'ensemble\n2. Modèle de données\n3. Le template DOCX\n4. Les champs (custom et partagés)\n"
+                "5. Les champs de type référence")
+    section3 = "3. Le template DOCX et ses placeholders\nLe template est un fichier Word avec des marqueurs {{nom:type}}."
+    section4 = ("4. Les champs (custom et partagés)\nUn champ décrit une donnée à saisir. Attributs : nom_champ, type, obligatoire.\n"
+                "POST /api/v1/shop/form-fields")
+    section5 = "5. Les champs de type référence\nUn champ peut pointer vers une table (public.pays)."
+    ids = db.replace_chunks("document", doc_id, [
+        ChunkRow(text=sommaire, line_start=1, line_end=9, meta={"page": 1}),
+        ChunkRow(text=section3, line_start=11, line_end=12, meta={"page": 2}),
+        ChunkRow(text=section4, line_start=14, line_end=16, meta={"page": 3, "section": "4. Les champs (custom et partagés)",
+                                                                   "heading_path": ["4. Les champs (custom et partagés)"]}),
+        ChunkRow(text=section5, line_start=18, line_end=19, meta={"page": 4}),  # sans métadonnées : titre lu dans le texte
+    ])
+    sommaire_hit = doc_hit(chunk_id=ids[0], source_id=doc_id, title="Paramétrage des formulaires", page=1, text=sommaire,
+                           extra={"document_id": doc_id}, reason="correspondance lexicale sur « champs »")
+    engine = FakeSearchEngine([sommaire_hit])
+    llm = FakeLLM([text_chunks("Le document décrit les champs [S1]."), text_chunks("Un champ décrit une donnée [S1].")])
+    orch = make_orchestrator(db, workspace, llm, engine, model_info=info(32768, tools=False))
+    conv = db.create_conversation()
+    first = await collect(orch, conv, "que dit le document paramétrage des formulaires")
+    assert [s["document_id"] for s in first[1].data["items"]] == [doc_id] and first[1].data["items"][0]["channels"] == ["lexical"]
+    events = await collect(orch, conv, "explique moi la définition des champs avec exemple")
+    assert types(events) == ["status", "sources", "delta", "done"]
+    assert events[0].data["text"].startswith("Question de suivi : contexte « Paramétrage des formulaires ")
+    items = events[1].data["items"]
+    # §4 (mot-clé « champs » dans le titre de section) puis §5 (titre lu dans le texte) puis le sommaire (mots du
+    # corps seulement) ; la section 3, sans mot-clé, n'est pas relue
+    assert [(s["ref"], s["line_start"], s["page"], s["channels"]) for s in items[:3]] == [
+        ("S1", 14, 3, ["followup"]), ("S2", 18, 4, ["followup"]), ("S3", 1, 1, ["followup"])]
+    assert items[0]["reason"] == "suite de la conversation : §4. Les champs (custom et partagés) de « Paramétrage des formulaires »"
+    assert items[1]["reason"] == "suite de la conversation : §5. Les champs de type référence de « Paramétrage des formulaires »"
+    assert all(s["line_start"] != 11 for s in items) and sum(1 for s in items if s["line_start"] == 1) == 1  # sommaire une fois
+    user_msg = llm.calls[1]["messages"][-1].content
+    assert ("[S1] Document « Paramétrage des formulaires » §4. Les champs (custom et partagés), page 3 — suite de la "
+            "conversation : §4. Les champs (custom et partagés) de « Paramétrage des formulaires »") in user_msg
+    assert "Un champ décrit une donnée à saisir" in user_msg and "{{nom:type}}" not in user_msg
+    # le passage relu porte l'empreinte du morceau (jumeaux fichier / document rapprochés par l'assembleur)
+    passages = followup_passages(db, "explique moi la définition des champs avec exemple", first[1].data["items"])
+    assert [p.chunk_id for p in passages] == [ids[2], ids[3], ids[0]] and passages[0].extra["sha1"] and passages[0].score == 0.0
+    # question sans mot-clé exploitable, sources précédentes absentes ou sans morceaux : aucun passage
+    assert followup_passages(db, "et ensuite ?", first[1].data["items"]) == []
+    assert followup_passages(db, "explique les champs", []) == []
+    assert followup_passages(db, "explique les champs", [{"document_id": doc_id + 100}, {"file_id": 99999}]) == []
+    # une question longue avec identifiant n'est pas un suivi : rien de relu
+    events = await collect(orch, conv, LONG_QUESTION)
+    assert events[0].data == {"text": "Recherche dans le projet…"}
+    assert all("followup" not in s["channels"] for s in events[1].data["items"])
+
+
+
+async def test_model_phase_statuses_announce_loading_then_reading(tmp_path):
+    """Après ``sources`` : « Chargement du modèle … » si le moteur ne l'a pas en mémoire, puis « Le modèle lit … »."""
+    from develop.chat.orchestrator import ChatOrchestrator, STATUS_LOADING, STATUS_READING
+
+    class _Llm(NullClient):
+        engine = "ollama"
+
+        def __init__(self, loaded):
+            super().__init__()
+            self._loaded = loaded
+
+        async def loaded_models(self):
+            return self._loaded
+
+        async def chat_stream(self, messages, model, **kwargs):  # type: ignore[override]
+            yield ChatChunk(text="ok", done=True)
+
+    db = Database(":memory:")
+    ws = WorkspaceConfig(id="w", name="w", llm=LLMConfig(engine="ollama", model="qwen3.8:27b"))
+    for loaded, expect_loading in (([], False), (["qwen3.8:27b"], False), (["autre:1b"], True)):
+        orch = ChatOrchestrator(db, ws, _Llm(loaded), FakeSearchEngine([]))
+        conv = db.create_conversation("t")
+        events = [e async for e in orch.respond(conv, "question ?", mode="no_tools")]
+        statuses = [e.data.get("text", "") for e in events if e.type == "status"]
+        assert any(t.startswith(STATUS_READING.split(" %d")[0]) for t in statuses)
+        assert any(t == STATUS_LOADING % "qwen3.8:27b" for t in statuses) is expect_loading

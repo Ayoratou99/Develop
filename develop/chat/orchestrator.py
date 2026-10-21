@@ -11,19 +11,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
 
 from develop.chat.budget import MIN_TOOL_BUDGET, Budget, compute_budget, estimate_tokens, tool_specs_tokens
-from develop.chat.context_builder import (ContextPack, Source, add_tool_sources, build_context,
+from develop.chat.context_builder import (ContextPack, LocalHit, Source, add_tool_sources, build_context,
                                           render_sources_as_text, render_sources_for_model)
 from develop.chat.prompts import HISTORY_SUMMARY_PREFIX, build_system_prompt
 from develop.chat.tools import TOOL_SPECS, ToolExecutor, ToolResult
 from develop.llm.base import (ChatMessage, LLMClient, LLMError, LLMUnavailable, ModelInfo, ModelNotFound, ToolCall,
                               parse_text_tool_calls)
 from develop.llm.offline_guard import OfflineViolation
+from develop.search.query import FOLLOWUP_MARKER  # le marqueur est reconnu par analyze_query : même source de vérité
 from develop.storage import Database, StorageError
 
 logger = logging.getLogger("develop.chat")
@@ -37,7 +40,56 @@ INTERRUPTED_PREFIX = "[réponse interrompue] "
 TOOLS_EXHAUSTED_TEXT = "Budget d'outils épuisé : réponds maintenant avec ce que tu as, en citant les sources disponibles."
 NO_ANSWER_TEXT = "Le modèle n'a renvoyé aucune réponse."
 STATUS_SEARCHING = "Recherche dans le projet…"
+STATUS_FOLLOWUP = "Question de suivi : contexte « %s » conservé"
+STATUS_SMALLTALK = "Petite conversation : réponse directe, sans recherche ni modèle."
+STATUS_LOADING = "Chargement du modèle %s en mémoire (jusqu'à 30 s la première fois)…"
+STATUS_READING = "Le modèle lit %d sources (≈ %d tokens) avant de répondre…"
+# Question « de suivi » (enrichie du tour précédent) : elle s'ouvre sur un mot de liaison (« et les champs ? »,
+# « ok mais pourquoi ? ») ou ne nomme aucun sujet à elle — ni identifiant, chemin, route ou table, ni mot-clé autre
+# qu'un mot d'*aspect* (« champs », « validation », « définition »… : une facette du sujet précédent, pas un sujet).
+# Une question qui nomme son sujet (« l'api d'authentification », « confirmer une commande », « OrderService::confirm »)
+# est autonome, quelle que soit sa longueur : une conversation change de sujet à chaque tour ou presque.
+FOLLOWUP_OPENERS = frozenset("et mais ok okay donc puis ensuite aussi alors sinon oui non encore idem pareil egalement "
+                             "d'accord daccord and but also then so".split())
+FOLLOWUP_ASPECT_WORDS = frozenset("""
+champ champs definition definitions validation validations verification verifications controle controles regle regles
+contrainte contraintes route routes endpoint endpoints url urls chemin chemins migration migrations seeder seeders
+relation relations lie liee lies liees lien liens dependance dependances appelant appelants methode methodes fonction fonctions attribut
+attributs propriete proprietes colonne colonnes table tables donnee donnees nom noms type types valeur valeurs format
+formats taille limite limites obligatoire obligatoires requis optionnel optionnels facultatif facultatifs nullable
+code structure schema implementation signature parametre parametres argument arguments retour resultat resultats
+entree entrees sortie sorties requete requetes reponse reponses message messages erreur erreurs statut statuts
+contenu logique comportement mecanisme processus flux etape etapes ordre sequence condition conditions cas suite
+reste liste listes test tests difference differences usage documentation page pages vue vues controleur controleurs
+service services classe classes fichier fichiers permission permissions droit droits autorisation autorisations
+politique politiques policy
+""".split())
+FOLLOWUP_MAX_TERMS = 8
+FOLLOWUP_SOURCES = 3  # titres / chemins des premières sources de la réponse précédente
+FOLLOWUP_MAX_PASSAGES = 3  # passages des sources précédentes remontés devant la recherche pour une question de suivi
+FOLLOWUP_MIN_KEYWORD_LENGTH = 3
+FOLLOWUP_CHANNEL = "followup"
+FOLLOWUP_REASON = "suite de la conversation : %s"
 USEFUL_TEXT_MIN_CHARS = 160
+
+# Petites conversations (≤ 3 mots) : réponse immédiate, sans recherche ni LLM.
+SMALLTALK_GREETINGS = frozenset("bonjour bonsoir salut hello hi hey coucou yo re rebonjour".split())
+SMALLTALK_THANKS = frozenset("merci thanks thank thx".split())
+# acquiescements : ils closent un échange… sauf quand le modèle vient de poser une question (ils y répondent)
+SMALLTALK_ACKS = frozenset("ok okay oki d'accord daccord dac compris parfait super top cool genial nickel bien".split())
+# oui / non : des réponses, adressées au modèle dès qu'il a parlé (« non » après une réponse la conteste)
+SMALLTALK_YES = frozenset("oui yes ouais yep si".split())
+SMALLTALK_NO = frozenset("non no nope nan".split())
+SMALLTALK_ANSWERS = SMALLTALK_YES | SMALLTALK_NO
+# phrase propre aux réponses de petite conversation : une telle réponse n'appelle rien de l'utilisateur
+SMALLTALK_SIGNATURE = "Je suis l'assistant de Develop pour l'espace de travail"
+SMALLTALK_WELLBEING = frozenset(("ca va", "ça va", "comment ca va", "comment ça va", "comment vas tu", "comment vas-tu",
+                                 "tu vas bien", "how are you"))
+SMALLTALK_FAREWELLS = frozenset(("bonne journee", "bonne soiree", "bonne nuit", "bon week-end", "bon weekend", "au revoir",
+                                 "a bientot", "a plus", "a plus tard", "bye", "ciao", "good bye", "goodbye"))
+SMALLTALK_FILLERS = frozenset("beaucoup bien tout le la a à toi vous bonne journee soiree et ça ca va tres très "
+                              "monde develop".split())
+SMALLTALK_MAX_WORDS = 3
 
 _CITATION_RE = re.compile(r"\[S(\d+)\]")
 _TOOL_LINE_RE = re.compile(r'^\s*`*\s*\{\s*"tool"\s*:.*\}\s*`*\s*$')  # ligne d'appel d'outil complète
@@ -185,6 +237,414 @@ def find_invalid_citations(text: str, valid_refs: Sequence[str]) -> List[str]:
         ref = "S%s" % m.group(1)
         if ref not in valid and ref not in out:
             out.append(ref)
+    return out
+
+
+# --------------------------------------------------------------------------- petites conversations
+
+def _fold(text: str) -> str:
+    """Minuscules sans accents ni ponctuation, espaces normalisés (« Ça va ?! » → « ca va »)."""
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
+    s = re.sub(r"[^\w' -]+", " ", s).replace("’", "'")
+    return " ".join(s.split())
+
+
+_TRAILING_DECOR_RE = re.compile(r"(\s|\[S\d+\]|[*_`)\]])+$")  # citations, emphase, parenthèses en fin de ligne
+
+
+def asks_a_question(text: str) -> bool:
+    """Vrai quand la dernière ligne non vide de ``text`` se termine par un point d'interrogation hors guillemets :
+    « Voulez-vous le détail des routes ? [S1] » en pose une, un exemple cité « que fait GET /orders ? » non."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    return _TRAILING_DECOR_RE.sub("", lines[-1]).endswith("?")
+
+
+def _formula_words(text: str) -> List[str]:
+    """Mots de ``text`` quand il a la forme d'une formule courte (≤ :data:`SMALLTALK_MAX_WORDS` mots, le premier
+    salutation, remerciement, acquiescement ou oui / non, les autres connus ou de liaison), sinon ``[]`` :
+    « ok mais pourquoi ? » n'en est pas une."""
+    words = _fold(text).split()
+    if not words or len(words) > SMALLTALK_MAX_WORDS:
+        return []
+    known = SMALLTALK_GREETINGS | SMALLTALK_THANKS | SMALLTALK_ACKS | SMALLTALK_ANSWERS
+    if words[0] not in known or not all(w in known or w in SMALLTALK_FILLERS for w in words):
+        return []
+    return words
+
+
+def is_reply_to_model(text: str, previous_answer: str) -> bool:
+    """Vrai pour une formule courte qui s'adresse au modèle plutôt qu'à l'assistant : « oui », « non », « non merci »
+    dès que le modèle a répondu (``previous_answer``, sa dernière réponse), « ok », « ok top », « d'accord » quand
+    cette réponse se termine par une question (« voulez-vous le détail des routes ? »). Une réponse de petite
+    conversation (:data:`SMALLTALK_SIGNATURE`) n'appelle rien : rien ne lui répond."""
+    words = _formula_words(text)
+    if not words:
+        return False
+    answer = str(previous_answer or "").strip()
+    if not answer or SMALLTALK_SIGNATURE in answer:
+        return False
+    if words[0] in SMALLTALK_ANSWERS:
+        return True
+    return words[0] in SMALLTALK_ACKS and asks_a_question(answer)
+
+
+def is_smalltalk(text: str, previous_answer: str = "") -> bool:
+    """Vrai pour une formule de politesse courte (« bonjour », « merci beaucoup », « ok », « ça va ? »).
+
+    ``previous_answer`` est la dernière réponse de l'assistant : un « oui » / « non » / « ok top » qui lui répond
+    (:func:`is_reply_to_model`) n'est pas une petite conversation, il doit parvenir au modèle. Sans ce contexte,
+    « oui » ou « non » seuls, sans rien à quoi répondre, restent une petite conversation.
+    """
+    folded = _fold(text)
+    if not folded or len(folded.split()) > SMALLTALK_MAX_WORDS:
+        return False
+    if folded in SMALLTALK_WELLBEING or folded in SMALLTALK_FAREWELLS:
+        return True
+    return bool(_formula_words(text)) and not is_reply_to_model(text, previous_answer)
+
+
+def _smalltalk_opening(text: str) -> str:
+    folded = _fold(text)
+    words = folded.split()
+    first = words[0] if words else ""
+    if folded in SMALLTALK_WELLBEING:
+        return "Très bien, merci ! Prêt à explorer le projet."
+    if folded in SMALLTALK_FAREWELLS:
+        return "À bientôt !"
+    if first in SMALLTALK_THANKS:
+        return "Avec plaisir !"
+    if first in SMALLTALK_GREETINGS:
+        return "Bonjour !"
+    if first in SMALLTALK_NO:
+        return "Entendu."
+    return "Très bien."
+
+
+def smalltalk_reply(db: Any, workspace_name: str, user_text: str = "") -> str:
+    """Réponse en français aux petites conversations : ce que Develop sait faire et des exemples adaptés à l'index.
+
+    Les exemples citent jusqu'à trois modèles de données et trois routes réellement indexés ; sans index,
+    des formulations génériques sont proposées.
+    """
+    models: List[str] = []
+    routes: List[str] = []
+    try:
+        for m in db.list_models() or []:
+            name = str(getattr(m, "name", "") or "")
+            if not name or str(getattr(m, "kind", "") or "") == "migration" or name in models:
+                continue
+            models.append(name)
+            if len(models) >= 3:
+                break
+    except Exception:  # noqa: BLE001
+        models = []
+    try:
+        for e in db.list_endpoints(side="server") or []:
+            handler = str(getattr(e, "handler", "") or "")
+            path = str(getattr(e, "path", "") or getattr(e, "normalized_path", "") or "")
+            if not path or handler.lower() == "closure":
+                continue
+            label = ("%s %s" % (str(getattr(e, "method", "") or "").upper(), path if path.startswith("/") else "/" + path)).strip()
+            if label not in routes:
+                routes.append(label)
+            if len(routes) >= 3:
+                break
+    except Exception:  # noqa: BLE001
+        routes = []
+    space = (" « %s »" % workspace_name) if workspace_name else ""
+    lines = [
+        "%s %s%s." % (_smalltalk_opening(user_text), SMALLTALK_SIGNATURE, space),
+        "Je réponds à partir de ce qui est indexé (code, symboles, routes, modèles de données, documents, notes) en citant "
+        "mes sources ; je ne connais pas le reste du projet.",
+        "",
+        "Je peux par exemple :",
+        "- décrire un modèle de données (champs, types, relations, migrations, règles de validation, routes) ;",
+        "- expliquer une route ou un endpoint et comment l'appeler ;",
+        "- retrouver qui appelle une fonction, l'impact d'un changement, ou ce que dit un document.",
+        "",
+        "Exemples de questions pour cet espace :",
+    ]
+    if models:
+        lines.append("- « décris-moi le modèle %s »" % models[0])
+        if len(models) > 1:
+            lines.append("- « quels sont les champs et la validation de %s ? »" % models[1])
+        if len(models) > 2:
+            lines.append("- « quelles routes manipulent %s ? »" % models[2])
+    else:
+        lines.append("- « décris-moi le modèle <Nom> »")
+    if routes:
+        lines.append("- « comment appeler %s ? »" % routes[0])
+        if len(routes) > 1:
+            lines.append("- « que fait %s ? »" % routes[1])
+        if len(routes) > 2:
+            lines.append("- « qui gère %s ? »" % routes[2])
+    else:
+        lines.append("- « comment appeler POST /<ressource> ? »")
+    lines.append("- « qui appelle <fonction> ? » / « quel est l'impact d'un changement sur <fichier> ? »")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- suivi de conversation
+
+_LABEL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{2,}$")  # nom nu : classe, modèle (« Shipment », « AuthController »)
+_LABEL_GENERIC = frozenset({"api", "app", "web", "index", "main", "routes", "config", "readme", "console", "kernel",
+                            "channels", "schema", "package", "composer"})
+
+
+def _source_label(source: Dict[str, Any]) -> str:
+    """Terme de suivi tiré d'une source enregistrée : le titre d'un document ou d'une note, le nom nu d'un fichier
+    de classe (``app/Models/Shipment.php`` → ``Shipment``), rien sinon.
+
+    Un nom de fichier composé (``contenu_configuration``, ``specification-formulaires-commandes``,
+    ``2026_06_30_create_form_templates_table``) n'est pas un terme : FTS5 le cherche comme une phrase exacte que seul ce
+    fichier contient, et comme tous les termes sont exigés ensemble (ET), le canal lexical ne renvoie plus que
+    ce fichier (le script qui génère un PDF, jamais le PDF). Le sujet est déjà porté par le titre du document
+    et les mots-clés de la question précédente.
+    """
+    if not isinstance(source, dict):
+        return ""
+    title = str(source.get("title") or "").strip()
+    path = str(source.get("path") or "")
+    if source.get("source_type") in ("document", "note") or source.get("document_id") is not None or not path:
+        return title
+    base = os.path.basename(path.rstrip("/"))
+    stem = base.split(".", 1)[0] if base else ""
+    if stem and _LABEL_NAME_RE.match(stem) and stem.lower() not in _LABEL_GENERIC:
+        return stem
+    return ""
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> Set[str]:
+    return set(_WORD_RE.findall(_fold(text)))
+
+
+def _keyword_in(words: Set[str], keyword: str) -> bool:
+    """Le mot-clé (replié) figure parmi ``words`` (repliés), au pluriel près (« champs » ~ « champ »)."""
+    if keyword in words:
+        return True
+    if len(keyword) < 4:
+        return False
+    stem = keyword[:-1] if keyword.endswith("s") else keyword
+    return stem in words or (stem + "s") in words or (stem + "x") in words
+
+
+def _chunk_headings(chunk: Any) -> List[str]:
+    """Titres d'un morceau : ``heading_path`` / ``section`` de ses métadonnées (documents découpés par
+    sections), sinon les lignes de titre numérotées de son texte suivies de texte (jamais celles d'un sommaire,
+    qui se suivent)."""
+    meta = getattr(chunk, "meta", None)
+    meta = meta if isinstance(meta, dict) else {}
+    out = [str(h) for h in (meta.get("heading_path") or []) if str(h).strip()]
+    section = meta.get("section") or meta.get("heading")
+    if section and str(section) not in out:
+        out.append(str(section))
+    if out:
+        return out
+    from develop.document_indexer.chunking import numbered_heading
+    lines = str(getattr(chunk, "text", "") or "").splitlines()
+    for i, line in enumerate(lines):
+        h = numbered_heading(line)
+        if h is None:
+            continue
+        following = next((l for l in lines[i + 1:] if l.strip()), "")
+        if following and numbered_heading(following) is None:
+            out.append(h[1])
+    return out
+
+
+def followup_passages(db: Database, user_text: str, previous_sources: Sequence[Dict[str, Any]],
+                      today: Optional[str] = None, max_passages: int = FOLLOWUP_MAX_PASSAGES) -> List[LocalHit]:
+    """Passages des sources citées au tour précédent qui répondent à la question de suivi elle-même.
+
+    Une question de suivi courte (« explique-moi la définition des champs ») vise une partie précise du sujet
+    précédent. La recherche enrichie des termes du tour précédent retrouve le sujet (le document, le fichier),
+    pas forcément cette partie : le sommaire d'un document contient tous les mots de la question, la section
+    demandée non. On relit donc les morceaux des :data:`FOLLOWUP_SOURCES` premières sources précédentes
+    (documents et fichiers) et on les classe par les mots-clés de la question seule : mots-clés présents dans
+    le titre de section du morceau d'abord (« 4. Les champs (custom et partagés) »), puis nombre de mots-clés
+    dans le texte, puis ordre des sources et du document. Au plus ``max_passages`` passages, distincts par
+    texte (le PDF d'un dépôt et le même PDF téléversé ne comptent qu'une fois), canal :data:`FOLLOWUP_CHANNEL`.
+    """
+    try:
+        from develop.search.query import analyze_query
+        raw_keywords = list(analyze_query(str(user_text or ""), today).keywords or [])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("analyse de la question de suivi impossible: %s", exc)
+        return []
+    keywords = [k for k in dict.fromkeys(_fold(k).replace(" ", "") for k in raw_keywords)
+                if len(k) >= FOLLOWUP_MIN_KEYWORD_LENGTH]
+    if not keywords or max_passages <= 0:
+        return []
+    targets: List[Tuple[str, int]] = []
+    for source in list(previous_sources or [])[:FOLLOWUP_SOURCES]:
+        if not isinstance(source, dict):
+            continue
+        doc_id, file_id = _as_int(source.get("document_id")), _as_int(source.get("file_id"))
+        key = ("document", doc_id) if doc_id is not None else (("file", file_id) if file_id is not None else None)
+        if key is not None and key not in targets:
+            targets.append(key)
+    scored: List[Tuple[Tuple[int, int, int, int], Any, str, int, Optional[str]]] = []
+    for order, (source_type, source_id) in enumerate(targets):
+        try:
+            chunks = db.chunks_for(source_type, source_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("morceaux de %s:%s illisibles: %s", source_type, source_id, exc)
+            continue
+        for chunk in chunks:
+            text = str(getattr(chunk, "text", "") or "")
+            if not text.strip():
+                continue
+            headings = _chunk_headings(chunk)
+            matched = [h for h in headings if any(_keyword_in(_words(h), k) for k in keywords)]
+            in_heading = sum(1 for k in keywords if _keyword_in(_words(" ".join(headings)), k))
+            in_body = sum(1 for k in keywords if _keyword_in(_words(text), k))
+            if not in_heading and not in_body:
+                continue
+            rank = (-in_heading, -in_body, order, int(getattr(chunk, "ordinal", 0) or 0))
+            scored.append((rank, chunk, source_type, source_id, matched[0] if matched else None))
+    scored.sort(key=lambda item: item[0])
+    out: List[LocalHit] = []
+    seen_text: Set[str] = set()
+    for _, chunk, source_type, source_id, heading in scored:
+        key = str(getattr(chunk, "sha1", "") or "") or " ".join(str(chunk.text).split())
+        if key in seen_text:
+            continue
+        seen_text.add(key)
+        out.append(_followup_hit(db, chunk, source_type, source_id, heading))
+        if len(out) >= max_passages:
+            break
+    return out
+
+
+def _followup_hit(db: Database, chunk: Any, source_type: str, source_id: int, heading: Optional[str] = None) -> LocalHit:
+    """:class:`LocalHit` d'un morceau relu pour une question de suivi (même forme que les hits du moteur) ;
+    ``heading`` est le titre de section du morceau qui a répondu à la question, cité dans la raison."""
+    meta = getattr(chunk, "meta", None)
+    meta = meta if isinstance(meta, dict) else {}
+    extra: Dict[str, Any] = {"ordinal": getattr(chunk, "ordinal", None)}
+    if getattr(chunk, "sha1", None):
+        extra["sha1"] = str(chunk.sha1)
+    title, path, repo_id, file_id = "", None, None, None
+    section: Optional[str] = str(heading) if heading else None
+    if source_type == "document":
+        doc = db.get_document(int(source_id))
+        title = doc.title if doc is not None and doc.title else "document %s" % source_id
+        extra["document_id"] = int(source_id)
+        if doc is not None:
+            extra["format"] = doc.format or ""
+            extra["source_path"] = doc.source_path or doc.stored_path or ""
+        heading_path = meta.get("heading_path") or []
+        own = meta.get("section") or meta.get("heading") or (heading_path[-1] if heading_path else None)
+        if own and str(own) != title:
+            extra["section"] = str(own)  # l'en-tête du bloc de contexte l'affiche (« §4. Les champs… »)
+            section = section or str(own)
+    else:
+        row = db.get_file_by_id(int(source_id))
+        if row is not None:
+            path, repo_id, file_id = row.path, row.repo_id, row.id
+            title = os.path.basename(row.path)
+            extra["language"] = row.language or ""
+            repo = db.get_repo(row.repo_id) if row.repo_id else None
+            if repo is not None:
+                extra["repo_name"] = repo.name
+        else:
+            file_id, title = int(source_id), "fichier %s" % source_id
+    where = ("§%s de « %s »" % (section, title)) if section else ("« %s »" % (path or title))
+    text = str(getattr(chunk, "text", "") or "")
+    return LocalHit(source_type=source_type, source_id=int(source_id), chunk_id=getattr(chunk, "id", None), title=title,
+                    path=path, repo_id=repo_id, file_id=file_id, line_start=getattr(chunk, "line_start", None),
+                    line_end=getattr(chunk, "line_end", None), page=_as_int(meta.get("page")), snippet=text[:300],
+                    text=text, score=0.0, channels=[FOLLOWUP_CHANNEL], reason=FOLLOWUP_REASON % where, extra=extra)
+
+
+def is_followup_question(user_text: str, analysis: Any = None, today: Optional[str] = None) -> bool:
+    """Vrai quand la question a besoin du tour précédent pour être cherchée.
+
+    Deux signes, lisibles sans modèle de langage : elle s'ouvre sur un mot de liaison (:data:`FOLLOWUP_OPENERS` :
+    « et ses commandes ? », « ok mais pourquoi ? »), ou elle ne nomme aucun sujet à elle — aucun identifiant, chemin,
+    route ni table, et pas un mot-clé qui ne soit un mot d'aspect (:data:`FOLLOWUP_ASPECT_WORDS` : « explique-moi la
+    définition des champs »). « quel est l'api d'authentification », « comment confirmer une commande » ou « qui
+    appelle OrderService::confirm ? » nomment leur sujet : autonomes. ``analysis`` est le résultat de
+    :func:`develop.search.query.analyze_query` sur la question, calculé s'il manque.
+    """
+    text = str(user_text or "")
+    words = _fold(text).split()
+    if not words:
+        return True
+    if words[0] in FOLLOWUP_OPENERS:
+        return True
+    if analysis is None:
+        try:
+            from develop.search.query import analyze_query
+            analysis = analyze_query(text, today)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("analyse de suivi impossible: %s", exc)
+            return False
+    for attr in ("identifiers", "paths", "routes", "tables"):
+        if list(getattr(analysis, attr, []) or []):
+            return False
+    keywords = [_fold(k) for k in (getattr(analysis, "keywords", []) or [])]
+    return all(k in FOLLOWUP_ASPECT_WORDS for k in keywords if k)
+
+
+def followup_terms(user_text: str, previous_question: str, previous_sources: Sequence[Dict[str, Any]],
+                   today: Optional[str] = None) -> List[str]:
+    """Termes du tour précédent à ajouter à la recherche d'une question de suivi, ou ``[]``.
+
+    Une question est « de suivi » au sens de :func:`is_followup_question` (mot de liaison en tête, ou aucun sujet
+    à elle). Les termes viennent des identifiants puis des mots-clés de la question précédente et des titres /
+    chemins (sans extension) des premières sources de la réponse précédente ; ceux déjà présents dans la question
+    sont omis, le tout borné à :data:`FOLLOWUP_MAX_TERMS`. Dans une vraie question de suivi ils **sont** le sujet
+    (« et ses commandes ? » → Customer) : le moteur les cherche avec les mots de la question (identifiants hérités à
+    poids plein, mots-clés hérités en départage des routes) ; une question autonome n'en reçoit jamais.
+    """
+    if not previous_question or not str(previous_question).strip():
+        return []
+    try:
+        from develop.search.query import analyze_query
+        current = analyze_query(str(user_text or ""), today)
+        previous = analyze_query(str(previous_question), today)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("analyse de suivi impossible: %s", exc)
+        return []
+    if not is_followup_question(user_text, current):
+        return []
+    keywords = list(getattr(current, "keywords", []) or [])
+    identifiers = list(getattr(current, "identifiers", []) or [])
+    present = {_fold(k) for k in keywords} | {_fold(i) for i in identifiers}
+    candidates: List[str] = list(getattr(previous, "identifiers", []) or [])
+    for s in list(previous_sources or [])[:FOLLOWUP_SOURCES]:
+        label = _source_label(s)
+        if label:
+            candidates.append(label)
+    candidates += [k for k in (getattr(previous, "keywords", []) or []) if len(str(k)) >= 4]  # « dit », « api »… : bruit
+    out: List[str] = []
+    seen: Set[str] = set()
+    for term in candidates:
+        term = str(term or "").strip()
+        key = _fold(term)
+        if not key or key in seen or key in present or len(key) < 2:
+            continue
+        # un titre de document est un groupe de mots : chaque mot déjà présent dans la question est inutile
+        if " " in key and all(w in present for w in key.split()):
+            continue
+        seen.add(key)
+        out.append(term)
+        if len(out) >= FOLLOWUP_MAX_TERMS:
+            break
     return out
 
 
@@ -367,6 +827,82 @@ class ChatOrchestrator:
                     summary = summary[:max_chars - 1].rstrip() + "…"
         return kept, summary, used
 
+    def _previous_answer(self, conversation_id: int, exclude_message_id: Optional[int]) -> str:
+        """Dernière réponse de l'assistant avant le message courant, ``""`` si le dernier message n'en est pas une."""
+        try:
+            conv = self.db.get_conversation(conversation_id) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("historique illisible pour la petite conversation: %s", exc)
+            return ""
+        messages = [m for m in conv.get("messages", []) if m.get("id") != exclude_message_id]
+        if not messages or messages[-1].get("role") != "assistant":
+            return ""
+        return str(messages[-1].get("content") or "")
+
+    def _previous_turn(self, conversation_id: int, exclude_message_id: Optional[int]) -> Tuple[str, List[Dict[str, Any]]]:
+        """``(dernière question utilisateur, sources de la réponse qui l'a suivie)`` avant le message courant.
+
+        Un « oui » / « non merci » / « ok » adressé au modèle (:func:`is_reply_to_model`) n'est pas une question :
+        la question est celle d'avant, les sources celles de la dernière réponse.
+        """
+        try:
+            conv = self.db.get_conversation(conversation_id) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("historique illisible pour le suivi: %s", exc)
+            return "", []
+        messages = [m for m in conv.get("messages", []) if m.get("id") != exclude_message_id]
+        question = ""
+        sources: List[Dict[str, Any]] = []
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            role = m.get("role")
+            if role == "assistant":
+                if not sources:
+                    sources = [s for s in (m.get("sources") or []) if isinstance(s, dict)]
+            elif role == "user":
+                content = str(m.get("content") or "")
+                before = messages[i - 1] if i > 0 else {}
+                answer = str(before.get("content") or "") if before.get("role") == "assistant" else ""
+                if is_reply_to_model(content, answer):
+                    continue
+                question = content
+                break
+        return question, sources
+
+    def _followup_context(self, conversation_id: int, exclude_message_id: Optional[int],
+                          user_text: str) -> Tuple[str, List[Dict[str, Any]]]:
+        """``(termes du tour précédent séparés par des espaces, sources de la réponse précédente)`` quand la
+        question est un suivi, sinon ``("", [])``."""
+        previous_question, previous_sources = self._previous_turn(conversation_id, exclude_message_id)
+        if not previous_question or is_smalltalk(previous_question):
+            return "", []
+        terms = followup_terms(user_text, previous_question, previous_sources, self.today)
+        if not terms:
+            return "", []
+        return " ".join(terms), previous_sources
+
+    def _with_followup_passages(self, hits: List[Any], previous_sources: Sequence[Dict[str, Any]],
+                                user_text: str) -> List[Any]:
+        """Passages de suivi (:func:`followup_passages`) placés devant les résultats de la recherche, au score du
+        meilleur résultat : ils passent en tête du contexte ; un morceau déjà trouvé par la recherche n'est pas
+        dupliqué (l'assembleur de contexte garde la première occurrence d'un ``chunk_id``)."""
+        try:
+            passages = followup_passages(self.db, user_text, previous_sources, self.today)
+        except Exception as exc:  # noqa: BLE001 - jamais de réponse perdue à cause du suivi
+            logger.debug("passages de suivi indisponibles: %s", exc)
+            return hits
+        if not passages:
+            return hits
+        top = 0.0
+        for h in hits:
+            try:
+                top = max(top, float(getattr(h, "score", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+        for p in passages:
+            p.score = round(top, 6)
+        return list(passages) + list(hits)
+
     def _store(self, conversation_id: int, content: str, pack: Optional[ContextPack]) -> Optional[int]:
         sources = [s.to_dict() for s in pack.sources] if pack is not None else []
         try:
@@ -393,6 +929,20 @@ class ChatOrchestrator:
                 "answer_reserve": budget.answer_reserve, "tools_mode": budget.tools_mode, "source": budget.source}
 
     # ------------------------------------------------------------------ flux principal
+    async def _announce_model_phase(self, n_sources: int, tokens: int):
+        """Événements ``status`` avant l'appel du modèle : chargement si le moteur dit qu'il n'est pas en
+        mémoire (Ollama : /api/ps), puis lecture des sources. Jamais d'exception."""
+        model = getattr(self.llm_cfg, "model", "") or ""
+        try:
+            loaded = await asyncio.wait_for(self.llm.loaded_models(), 3.0)
+        except Exception:  # noqa: BLE001 - moteur muet ou lent : on n'annonce rien de plus
+            loaded = []
+        if model and loaded:
+            base = model.split(":")[0]
+            if not any(m == model or m.split(":")[0] == base for m in loaded):
+                yield _event("status", text=STATUS_LOADING % model)
+        yield _event("status", text=STATUS_READING % (n_sources, tokens))
+
     async def respond(self, conversation_id: int, user_text: str, mode: str = "auto",
                       max_context_tokens: Optional[int] = None,
                       cancel: Optional[asyncio.Event] = None) -> AsyncIterator[ChatEvent]:
@@ -412,19 +962,53 @@ class ChatOrchestrator:
                 yield _event("error", code="conversation_not_found", message=str(exc))
                 return
 
-            # (2) recherche
-            yield _event("status", text=STATUS_SEARCHING)
-            hits, intent = await self._search(user_text)
+            # (1 bis) petites conversations : réponse immédiate, sans recherche ni modèle (mode recherche seule inchangé) ;
+            #         un « oui » / « non » / « ok » qui répond à une question du modèle lui parvient (question de suivi)
+            if mode != "search_only" and is_smalltalk(user_text, self._previous_answer(conversation_id, user_message_id)):
+                content = smalltalk_reply(self.db, str(getattr(self.workspace, "name", "") or ""), user_text)
+                budget, _ = self._plan("none", "factual", max_context_tokens, user_text)
+                yield _event("status", text=STATUS_SMALLTALK)
+                yield _event("sources", items=[])
+                emitted.append(content)
+                yield _event("delta", text=content)
+                message_id = self._store(conversation_id, content, None)
+                stored = True
+                yield _event("done", message_id=message_id, usage={}, budget=self._budget_dict(budget, None, 0, 0),
+                             truncated_sources=[], invalid_citations=[], cancelled=False, mode=mode)
+                return
+
+            # (2) recherche : une question de suivi (mot de liaison en tête ou sans sujet à elle, voir
+            #     :func:`is_followup_question`) cherche aussi avec les termes du tour précédent (un seul événement
+            #     status, qui le dit) et relit les sources précédentes
+            #     (:func:`followup_passages`) ; la question d'origine seule va au modèle
+            search_text = user_text
+            followup, followup_sources = (self._followup_context(conversation_id, user_message_id, user_text)
+                                          if mode != "search_only" else ("", []))
+            if followup:
+                search_text = "%s %s" % (user_text.strip(), FOLLOWUP_MARKER % followup)
+                yield _event("status", text=STATUS_FOLLOWUP % followup)
+            else:
+                yield _event("status", text=STATUS_SEARCHING)
+            hits, intent = await self._search(search_text)
+            if followup:
+                # les passages des sources précédentes qui répondent à la question elle-même (section demandée
+                # d'un document) passent devant : la recherche retrouve le sujet, pas toujours la partie visée
+                hits = self._with_followup_passages(hits, followup_sources, user_text)
 
             # (3) budget : consignes système mesurées (définitions d'outils natifs comprises), mode d'outils
             #     effectif (``none`` si la fenêtre ne porte pas les outils), question comptée
             budget, system_text = self._plan(self._tools_mode(mode), intent, max_context_tokens, user_text)
             tools_mode = budget.tools_mode
 
-            # (4) contexte
-            pack = build_context(hits, budget.context_tokens_max, intent)
+            # (4) contexte : fiches structurées (modèles, routes, classes) en tête, puis passages
+            pack = build_context(hits, budget.context_tokens_max, intent, db=self.db)
             context_tokens = pack.tokens_used  # contexte initial seul : les outils ajoutent ensuite au pack
             yield _event("sources", items=[s.to_dict() for s in pack.sources])
+            if mode != "search_only":
+                # L'attente la plus longue est la lecture du contexte par le modèle (préremplissage), précédée
+                # du chargement du modèle s'il a été déchargé : on le dit, au lieu de laisser « Recherche… ».
+                async for ev in self._announce_model_phase(len(pack.sources), pack.tokens_used):
+                    yield ev
 
             # (5) recherche seule : pas de LLM
             if mode == "search_only":

@@ -236,6 +236,21 @@ class AppState:
         self.set_model_info(info)
         return info
 
+    async def warm_models(self, timeout: float = 300.0) -> bool:
+        """Précharge le modèle de chat et le modèle d'embeddings pour que la première question ne paie pas
+        le chargement (≈ 30 s pour un modèle de 20 Go). Ne lève jamais ; False si rien n'a été préchargé."""
+        ws = self.workspace
+        if ws is None or ws.llm.engine == "none" or not ws.llm.model:
+            return False
+        warmed = False
+        try:
+            warmed = bool(await asyncio.wait_for(self.llm.warm(ws.llm.model), timeout))
+            if ws.llm.embedding_model:
+                await asyncio.wait_for(self.llm.embed(["préchauffage"], ws.llm.embedding_model), 120.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("préchauffage du modèle %s impossible : %s", ws.llm.model, exc)
+        return warmed
+
     def set_model_info(self, info: Optional[ModelInfo]) -> None:
         self.model_info = info
         if self.orchestrator is not None:

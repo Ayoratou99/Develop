@@ -4,10 +4,14 @@
 import { api, streamPost } from '/static/api.js';
 import {
   el, replace, icon, toast, toastError, errorBox, infoBox, emptyState, spinner, renderMarkdown,
-  confirmDialog, promptDialog, formatNumber, formatRelative, badge, collapsible,
+  confirmDialog, promptDialog, formatNumber, formatRelative, badge, collapsible, copyButton,
 } from '/static/ui.js';
 import { state, navigate, refreshStatus } from '/static/app.js';
 import { ENGINE_LABELS } from '/static/views/setup.js';
+
+/** Commande proposée par le bandeau « Recherche lexicale seule » (modèle d'embeddings léger, 0,6 Go). */
+export const EMBEDDING_PULL_COMMAND = 'ollama pull qwen3-embedding:0.6b';
+const EMBEDDINGS_BANNER_KEY = 'develop.chat.embeddingsBannerDismissed';
 
 const MODES = [
   { value: 'auto', label: 'Auto', help: 'Recherche dans le projet, puis le modèle peut demander des outils (lecture de fichier, appelants…) : au plus 4 tours.' },
@@ -39,14 +43,64 @@ function sourceLabel(src) {
 }
 
 /**
- * Pied de message « Contexte : 1 081 / 1 081 (num_ctx 8 192) » : passages retenus par la recherche initiale
- * et leur budget. Les sources ajoutées ensuite par les outils ne s'y cumulent pas (elles sont comptées
- * dans `toolsUsage`), donc le ratio ne dépasse jamais 100 %.
+ * Pied de message lisible, à partir de `done.budget` : « contexte 2 758 / 2 758 tokens — 7 sources sur
+ * 23 retenues » (passages retenus par la recherche initiale sur leur budget ; les sources ajoutées
+ * ensuite par les outils sont comptées dans `toolsUsage`, le ratio ne dépasse donc jamais 100 %), puis,
+ * si des sources ont été écartées, « 3 sources n'ont pas tenu dans le contexte : augmentez num_ctx ».
+ * `retained` : nombre de sources de la recherche initiale ; `truncated` : `done.truncated_sources`.
+ * Renvoie une liste de nœuds (vide sans budget).
  */
-function contextUsage(budget) {
-  if (!budget.num_ctx) return null;
-  return el('span', { title: 'Passages retenus par la recherche initiale, sur le budget de contexte de la question' },
-    `Contexte : ${formatNumber(budget.context_tokens_used || 0)} / ${formatNumber(budget.max_context_tokens || budget.num_ctx)} (num_ctx ${formatNumber(budget.num_ctx)})`);
+export function budgetFooter(budget, retained, truncated) {
+  const nodes = [];
+  const b = budget || {};
+  const dropped = Array.isArray(truncated) ? truncated : [];
+  const kept = Math.max(0, Number(retained) || 0);
+  if (b.num_ctx) {
+    const total = kept + dropped.length;
+    const sources = total
+      ? `${kept} source${kept > 1 ? 's' : ''} sur ${total} retenue${kept > 1 ? 's' : ''}`
+      : 'aucune source';
+    nodes.push(el('span', { class: 'budget-line', title: b.source || `num_ctx ${formatNumber(b.num_ctx)}` },
+      `contexte ${formatNumber(b.context_tokens_used || 0)} / ${formatNumber(b.max_context_tokens || b.num_ctx)} tokens — ${sources}`));
+  }
+  if (dropped.length) {
+    const n = dropped.length;
+    nodes.push(el('span', { class: 'budget-truncated', title: dropped.map((s) => s.path || s.title || s.ref || '?').join('\n') },
+      `${n} source${n > 1 ? 's' : ''} n'${n > 1 ? 'ont' : 'a'} pas tenu dans le contexte : `,
+      el('a', { href: '#/settings', title: 'Fenêtre de contexte (num_ctx) dans Réglages › Moteur d\'IA' }, 'augmentez num_ctx')));
+  }
+  return nodes;
+}
+
+/** Drapeau de session (sessionStorage) ; lecture si `value` est omis. Indisponible (navigation privée…) → false. */
+function sessionFlag(key, value) {
+  try {
+    if (value === undefined) return window.sessionStorage.getItem(key) === '1';
+    window.sessionStorage.setItem(key, value ? '1' : '');
+  } catch (_) { /* stockage indisponible : le bandeau reviendra à la prochaine ouverture de la vue */ }
+  return false;
+}
+
+/**
+ * Bandeau « Recherche lexicale seule » tant que l'espace n'a pas de modèle d'embeddings
+ * (`status.workspace.llm.embedding_model` vide) alors qu'un moteur est configuré : lien vers les réglages,
+ * commande d'installation à copier, masquable pour la session (sessionStorage). Null sinon.
+ * Sans moteur du tout, l'encadré « Aucun moteur configuré » du fil suffit (les embeddings passent par le moteur).
+ */
+export function embeddingsBanner(status) {
+  const llm = status && status.workspace && status.workspace.llm;
+  if (!llm || !llm.engine || llm.engine === 'none' || llm.embedding_model) return null;
+  if (sessionFlag(EMBEDDINGS_BANNER_KEY)) return null;
+  const banner = el('div', { class: 'alert alert-info chat-banner', role: 'status' }, icon('info', 18),
+    el('div', { class: 'alert-body' },
+      el('strong', 'Recherche lexicale seule.'),
+      ' Pour la recherche sémantique (questions formulées autrement que le code), ajoutez un modèle d\'embeddings dans ',
+      el('a', { href: '#/settings' }, 'Réglages › Moteur d\'IA'),
+      ' — par exemple ', el('code', { class: 'md-code' }, EMBEDDING_PULL_COMMAND), ' ', copyButton(EMBEDDING_PULL_COMMAND, 'Copier'),
+      ' (0,6 Go) — puis réindexez.'),
+    el('button', { class: 'btn btn-ghost btn-icon btn-sm', type: 'button', title: 'Masquer pour cette session', 'aria-label': 'Masquer ce bandeau pour cette session',
+      onClick: () => { sessionFlag(EMBEDDINGS_BANNER_KEY, true); banner.remove(); } }, icon('close', 14)));
+  return banner;
 }
 
 /** Pied de message « Outils : 1 542 / 3 765 tokens (1 tour) » : consommation des tours d'outils, null sans tour. */
@@ -228,15 +282,26 @@ export async function mount(root, route) {
     scrollToEnd();
 
     let sources = [];
+    let initialSources = 0; // sources retenues par la recherche initiale (avant les ajouts des outils)
     let text = '';
     let pendingRender = false;
     const rerender = () => { renderAnswer(body, text, sources); pendingRender = false; scrollToEnd(); };
 
+    // Compteur de secondes sur la ligne d'état : l'attente la plus longue est la lecture du contexte par le modèle.
+    let statusSince = Date.now();
+    const elapsedEl = el('span', { class: 'muted' }, '');
+    const ticker = setInterval(() => {
+      const s = Math.round((Date.now() - statusSince) / 1000);
+      elapsedEl.textContent = s >= 3 ? ` (${s} s)` : '';
+    }, 1000);
+    const stopTicker = () => { clearInterval(ticker); elapsedEl.textContent = ''; };
     const onEvent = (name, data) => {
       if (name === 'status') {
-        replace(statusLine, el('span', { class: 'spinner' }), el('span', data.text || ''));
+        statusSince = Date.now();
+        replace(statusLine, el('span', { class: 'spinner' }), el('span', data.text || ''), elapsedEl);
       } else if (name === 'sources') {
         sources = data.items || [];
+        initialSources = sources.length;
         replace(sourcesHost, sourcesPanel(sources, mode === 'search_only'));
       } else if (name === 'tool_call') {
         toolsHost.appendChild(collapsible(el('span', { class: 'row' }, badge('outil', 'accent'), `${data.name || '?'}`),
@@ -259,7 +324,7 @@ export async function mount(root, route) {
         // Rendu Markdown à la fin de chaque paragraphe pour limiter le coût.
         if ((data.text || '').includes('\n\n')) rerender();
         else if (!pendingRender) { pendingRender = true; setTimeout(rerender, 250); }
-        statusLine.classList.add('hidden');
+        statusLine.classList.add('hidden'); stopTicker();
       } else if (name === 'done') {
         const usage = data.usage || {};
         const budget = data.budget || {};
@@ -267,9 +332,8 @@ export async function mount(root, route) {
         replace(foot,
           usage.prompt_tokens !== undefined ? el('span', `Entrée : ${formatNumber(usage.prompt_tokens)} tokens`) : null,
           usage.completion_tokens !== undefined ? el('span', `Réponse : ${formatNumber(usage.completion_tokens)} tokens`) : null,
-          contextUsage(budget),
-          toolsUsage(budget),
-          truncated.length ? el('span', { class: 'muted', title: truncated.map((s) => s.path || s.title || s.ref).join('\n') }, `${truncated.length} source(s) non consultée(s), budget atteint`) : null);
+          budgetFooter(budget, initialSources, truncated),
+          toolsUsage(budget));
         if (mode === 'search_only' && !text) replace(body, el('p', { class: 'muted' }, sources.length ? 'Sources trouvées ci-dessus (aucun appel au modèle).' : 'Aucune source trouvée pour cette question.'));
       } else if (name === 'error') {
         const err = { code: data.code, message: data.message || 'Erreur inconnue' };
@@ -301,7 +365,7 @@ export async function mount(root, route) {
       }
     } finally {
       abort = null;
-      statusLine.classList.add('hidden');
+      statusLine.classList.add('hidden'); stopTicker();
       // Dernier rendu seulement s'il y a du texte : ne pas effacer le message de remplacement
       // (mode « Recherche seule ») que l'événement done a placé dans `body`.
       if (text || pendingRender) rerender();
@@ -338,6 +402,7 @@ export async function mount(root, route) {
         el('button', { class: 'btn btn-sm', type: 'button', title: 'Nouvelle conversation', onClick: () => navigate('#/chat') }, icon('plus', 14), 'Nouvelle')),
       convList),
     el('section', { class: 'chat-main' },
+      embeddingsBanner(state.status),
       thread,
       el('div', { class: 'chat-compose' }, el('div', { class: 'compose-box' },
         input,

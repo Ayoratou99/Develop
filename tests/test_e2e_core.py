@@ -113,8 +113,19 @@ class ScriptedLLM(LLMClient):
         return [[0.0] for _ in texts]
 
 
+def _without_statuses(events):
+    """Retire les ``status`` informatifs émis après ``sources`` (indices stables dans les assertions)."""
+    out, seen = [], False
+    for e in events:
+        seen = seen or e.type == "sources"
+        if e.type == "status" and seen:
+            continue
+        out.append(e)
+    return out
+
+
 async def _collect(orch: ChatOrchestrator, conversation_id: int, text: str, **kwargs: Any) -> List[ChatEvent]:
-    return [ev async for ev in orch.respond(conversation_id, text, **kwargs)]
+    return _without_statuses([ev async for ev in orch.respond(conversation_id, text, **kwargs)])
 
 
 # --------------------------------------------------------------------------- fixture partagée
@@ -156,6 +167,17 @@ def env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
 
 
 # --------------------------------------------------------------------------- 1. indexation
+
+def _types(events):
+    """Types des événements sans les ``status`` informatifs émis après ``sources``."""
+    out, seen = [], False
+    for e in events:
+        seen = seen or e.type == "sources"
+        if e.type == "status" and seen:
+            continue
+        out.append(e.type)
+    return out
+
 
 def test_first_run_indexes_five_repos(env: SimpleNamespace):
     run, db = env.run, env.db
@@ -342,7 +364,7 @@ async def test_chat_search_only_without_engine(env: SimpleNamespace):
                             profile=_profile(), model_info=None, today="2026-10-20")
     conv = db.create_conversation("e2e")
     events = await _collect(orch, conv, "Quels champs a la table orders ?", mode="search_only")
-    assert [e.type for e in events] == ["status", "sources", "done"]
+    assert _types(events) == ["status", "sources", "done"]
     sources = events[1].data["items"]
     assert sources and [s["ref"] for s in sources] == ["S%d" % (i + 1) for i in range(len(sources))]
     assert any((s.get("path") or "").endswith("dictionnaire-donnees.md") or s["source_type"] == "model" for s in sources)
@@ -371,7 +393,7 @@ async def test_chat_auto_with_scripted_llm_and_native_search_tool(env: SimpleNam
                             profile=_profile(), model_info=info, today="2026-10-20")
     conv = db.create_conversation("e2e auto")
     events = await _collect(orch, conv, "Quand une commande peut-elle être confirmée ?")
-    assert [e.type for e in events] == ["status", "sources", "tool_call", "tool_result", "delta", "delta", "done"]
+    assert _types(events) == ["status", "sources", "tool_call", "tool_result", "delta", "delta", "done"]
     assert events[1].data["items"] and events[1].data["items"][0]["ref"] == "S1"
     assert events[2].data["name"] == "search" and events[2].data["arguments"] == {"query": "statut confirmed commande"}
     result = events[3].data

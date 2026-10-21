@@ -1,21 +1,58 @@
 """Moteur de recherche hybride multi-canaux de Develop.
 
-Pour une question, cinq canaux sont interrogés puis **fusionnés** (Reciprocal Rank Fusion) :
+Pour une question, six canaux sont interrogés puis **fusionnés** (Reciprocal Rank Fusion) :
 
 * ``identifier`` — correspondance exacte (insensible à la casse) des identifiants, routes, tables et
   chemins extraits de la question sur les symboles, endpoints, modèles de données et chemins de
-  fichiers, plus les « mots collés » (``user controller`` → ``UserController``) ; un identifiant
-  resté sans correspondance est ensuite cherché à l'**orthographe approchée** parmi les noms de
-  symboles (``confrimOrder`` → ``confirmOrder``, ``OrderServce::confrim`` → ``OrderService::confirm``),
-  à un poids inférieur, et chaque approximation est signalée dans ``SearchResult.warnings`` ; les mots génériques
-  (« table », « modèle »…) ne sont jamais pris pour des noms nus ;
-* ``lexical`` — FTS5 / BM25 sur les morceaux (code, documents, notes) ;
+  fichiers, plus les « mots collés » (``user controller`` → ``UserController``, ``order line`` →
+  ``OrderLine``, paires et triplets de mots adjacents) ; un identifiant resté sans correspondance est
+  ensuite cherché à l'**orthographe approchée** parmi les noms de symboles (``confrimOrder`` →
+  ``confirmOrder``, ``OrderServce::confrim`` → ``OrderService::confirm``), à un poids inférieur, et
+  chaque approximation est signalée dans ``SearchResult.warnings`` ; les mots génériques (« table »,
+  « modèle »…) ne sont jamais pris pour des noms nus, et un **mot courant** sans forme de code
+  (« definition », « put », « user » — :data:`develop.search.query.COMMON_WORDS`) n'est accepté comme
+  nom exact que pour une classe / un modèle / une table, ou un membre d'une classe citée dans la même
+  question (``OrderService confirm``) : les méthodes homonymes (``UserFactory::definition``) ont un
+  poids nul — sauf quand la question **emploie le mot comme un nom de code** (:func:`word_names_symbol` :
+  « que fait la méthode confirm ? », « explique store », « où est défini index ? », « confirm() »), les
+  actions des contrôleurs étant presque toutes des mots courants ; les **expansions** de vocabulaire
+  (``utilisateur`` → ``user``) sont essayées de la même façon, restreintes aux classes et modèles ;
+* ``route`` — endpoints dont le chemin ou le gestionnaire **contient** un mot-clé, un mot collé ou un
+  terme d'expansion de la question (« authentification » → ``auth``, ``login`` → ``POST /auth/login``) ;
+  un terme présent dans plus de :data:`ROUTE_LIMIT` routes ne désigne rien (« api », « store »), ni un
+  mot hérité du tour précédent d'une question de suivi qui n'est pas un identifiant (« commande » d'un titre
+  cité) : ils ne servent qu'à départager les routes trouvées par un terme plus précis de la question. Les
+  routes classées d'abord par preuves fortes (terme égal à un segment / une action), puis route serveur avant appel client, puis
+  nombre de termes contenus ; un appel client dont le chemin n'est qu'une variable (« POST $url ») est
+  ignoré. Après la fusion, un appel client ne précède jamais la route serveur qu'il vise (même chemin
+  normalisé) : il est replacé juste derrière elle, sauf pour une question d'impact (« qui appelle ») ;
+* ``lexical`` — FTS5 / BM25 sur les morceaux (code, documents, notes) avec les mots-clés, puis une
+  requête secondaire en OU sur les termes d'expansion, à un poids plus faible (:data:`W_EXPANSION`) ;
+  pour une question de suivi, les termes hérités du tour précédent forment eux aussi une requête
+  secondaire en OU (:data:`W_PREVIOUS`) au lieu d'être exigés en ET avec les mots de la question ;
+  les morceaux des **fichiers générés volumineux** (plus de :data:`GENERATED_FILE_MAX_BYTES`, ou
+  ``api-docs``, ``swagger.json``, ``*.lock``, ``*.min.*``, ``storage/app|framework|logs/``, ``public/build``…) voient leur
+  apport divisé par deux et un seul morceau par tel fichier reste en tête du canal, les autres étant
+  renvoyés en queue (raison « fichier généré volumineux ») ;
 * ``semantic`` — cosinus numpy sur les embeddings locaux (ignoré, sans erreur, quand aucun vecteur
   n'est disponible) ;
 * ``graph`` — expansion d'un saut dans le graphe de relations à partir des noeuds trouvés par le
-  canal ``identifier`` (fichiers importateurs, gestionnaires de route, modèles liés, documents…) ;
+  canal ``identifier`` et des premières routes du canal ``route`` (gestionnaires de route, modèles
+  liés, documents, fichiers importateurs…). Le **fichier** d'une graine n'est lui-même une graine
+  que pour une classe / un symbole de premier niveau cité (ses importateurs l'utilisent) ou un fichier
+  nommé dans la question, jamais pour une route (le fichier de routes importe tous les contrôleurs du
+  module, pas celui de la route, atteint par ``handles``) ni pour un modèle — même via sa classe
+  homonyme ou un mot nu égal à son nom — hors question d'impact (``who_calls`` / ``impact``, où les
+  importateurs sont la surface d'impact) ; les fichiers atteints « via imports » sont limités à
+  :data:`GRAPH_IMPORTS_PER_SEED` par graine et passent après ses autres relations : leur premier
+  morceau (namespace + ``use``) n'apprend rien ;
 * ``temporal`` — notes datées (intervalle de dates de la question, ou notes récentes pour une
   question de décision).
+
+Un résultat de type ``endpoint`` porte dans ``extra`` son gestionnaire (``handler``), son cadriciel
+(``framework``) et, si une classe de validation ``<Action><Contrôleur>Request`` /
+``Store|Update|Index<Modèle>Request`` existe dans l'index, ``request_class`` (nom) et
+``request_class_id``.
 
 Après fusion : déduplication (même morceau, ou même fichier avec lignes qui se chevauchent),
 diversité (au plus :data:`MAX_PER_SOURCE` morceaux par fichier/document/note), tri décroissant,
@@ -33,6 +70,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -42,7 +80,7 @@ import numpy as np
 
 from develop.llm.base import LLMClient
 from develop.search import query as _query
-from develop.search.query import QueryAnalysis, analyze_query, fold
+from develop.search.query import ACTION_TERMS, QueryAnalysis, analyze_query, fold, has_code_shape, is_common_word
 from develop.storage import (
     SOURCE_TYPES,
     ChunkRow,
@@ -50,10 +88,12 @@ from develop.storage import (
     DocumentRow,
     EndpointRow,
     FileRow,
+    FtsHit,
     ModelRow,
     NoteRow,
     RepoRow,
     SymbolRow,
+    build_fts_query,
     fts_terms,
     node_key,
 )
@@ -65,7 +105,7 @@ except Exception:  # noqa: BLE001 - import défensif
 
 logger = logging.getLogger("develop.search")
 
-CHANNELS = ("identifier", "lexical", "semantic", "graph", "temporal")
+CHANNELS = ("identifier", "route", "lexical", "semantic", "graph", "temporal")
 HIT_SOURCE_TYPES = ("file", "document", "note", "symbol", "endpoint", "model")
 RRF_K = 60
 IDENTIFIER_BONUS = 1.5  # les correspondances exactes valent plus que les approximations
@@ -75,6 +115,148 @@ W_EXPLICIT = 2.0  # Classe::membre, route avec son chemin, chemin de fichier
 W_NAMED = 1.0  # identifiant nommé (camelCase, snake_case…), table citée, nom de fichier, mots collés
 W_BARE = 0.6  # mot-clé nu égal à un nom de symbole / modèle, radical de nom de fichier
 W_FUZZY = 0.5  # orthographe approchée d'un identifiant (repli « faute de frappe »), sous les mots nus
+W_EXPANSION = 0.5  # canal lexical : morceaux trouvés par les termes d'expansion seulement (requête en OU)
+# Canal lexical, question de suivi : morceaux trouvés par les termes hérités du tour précédent (requête en OU) ; le
+# sujet conservé pèse plus qu'une expansion de vocabulaire, moins que les mots de la question elle-même.
+W_PREVIOUS = 0.75
+# Mots courants (« definition », « user »…) : seuls ces genres de symboles comptent comme nom exact.
+CLASS_KINDS: FrozenSet[str] = frozenset({"class", "interface", "trait", "enum", "struct", "record", "type", "typedef",
+                                         "model", "entity", "component", "dataclass", "dart_class", "mixin",
+                                         "protocol", "module", "table", "eloquent", "sqlalchemy", "django", "jpa"})
+# … sauf quand la question **emploie le mot comme un nom de code** (:func:`word_names_symbol`) : les actions des
+# contrôleurs (confirm, store, update, index, show, login…) sont presque toutes des mots courants.
+# Mots de la phrase qui annoncent une méthode / fonction juste avant le nom (« la méthode confirm », « l'action
+# store », « où est défini confirm »)…
+_CODE_CUES_BEFORE: FrozenSet[str] = frozenset("""
+methode methodes method methods fonction fonctions function functions func def defini definie definis definies
+defined implemente implementee implementes implementees implemented declare declaree declares declarees declared
+action actions membre membres member members handler handlers callback callbacks hook hooks helper helpers
+accessor accessors mutator mutators getter getters setter setters scope scopes procedure procedures routine
+routines symbole symboles symbol symbols
+""".split())
+# … ou juste après (« the confirm method », « confirm function »)…
+_CODE_CUES_AFTER: FrozenSet[str] = frozenset("""
+methode methodes method methods fonction fonctions function functions action actions handler handlers callback
+callbacks helper helpers hook hooks membre member
+""".split())
+# … et les verbes d'explication dont le complément direct est le nom demandé (« explique confirm », « que fait
+# store ? », « what does confirm do »).
+_EXPLAIN_VERBS: FrozenSet[str] = frozenset("""
+explique expliquer expliques expliquez explain explains decris decrire decrit decrivez describe describes montre
+montrer montrez show shows affiche afficher affichez display fait font does do did sert marche fonctionne works
+resume resumer summarize detaille detailler documente documenter commente commenter define defines definir
+""".split())
+# Jetons sautés en remontant vers le mot précédent (« explique-moi confirm », « montre me store »).
+_POLITE_TOKENS: FrozenSet[str] = frozenset({"moi", "me", "svp", "stp", "please"})
+# Déterminants et pronoms sujets : un mot qui les suit est un mot de la phrase, pas un nom de code (« les logs »,
+# « le template », « tu put m'expliquer » — faute de frappe pour « peux »).
+_DETERMINERS: FrozenSet[str] = frozenset("""
+le la les l un une des du ce cet cette ces mon ma mes ton ta tes son sa ses notre votre nos vos leur leurs
+the a an this that these those my your his her its our their je tu il elle on nous vous ils elles i you he she
+we they it
+""".split())
+# Mots qui annoncent une classe / un modèle / une table / un fichier (« le modèle User », « la table de user »,
+# « le fichier config ») : le mot qui les suit, même étranger à la langue de la question, ne nomme pas une méthode.
+_CLASS_CUES_BEFORE: FrozenSet[str] = frozenset("""
+modele modeles model models classe classes class table tables entite entites entity entities interface interfaces
+trait traits enum enums type types objet objets object objects controleur controleurs controller controllers
+service services repository repositories factory factories migration migrations schema fichier fichiers file files
+document documents composant composants component components module modules
+""".split())
+_PREPOSITIONS: FrozenSet[str] = frozenset({"de", "d", "of"})  # « le code de confirm » : le mot de tête est « code »
+# Mots courants d'une seule des deux langues des listes de :mod:`develop.search.query` (« confirm », « store » :
+# anglais seulement ; « calculer », « garde » : français seulement) ; employés dans une question de l'autre langue, ils
+# sont des noms de code. Les mots de grammaire / de question propres à une langue révèlent celle de la question.
+_COMMON_EN: FrozenSet[str] = frozenset(fold(w) for w in getattr(_query, "_COMMON_WORDS_EN", ()))
+_COMMON_FR: FrozenSet[str] = frozenset(fold(w) for w in getattr(_query, "_COMMON_WORDS_FR", ())) | frozenset(
+    getattr(_query, "_EXPANSION_WORDS", {}))
+_COMMON_EN_ONLY: FrozenSet[str] = _COMMON_EN - _COMMON_FR
+_COMMON_FR_ONLY: FrozenSet[str] = _COMMON_FR - _COMMON_EN
+_MARKERS_FR_ALL: FrozenSet[str] = frozenset(
+    fold(w) for w in (*getattr(_query, "_STOPWORDS_FR", ()), *getattr(_query, "_QUESTION_WORDS_FR", ())))
+_MARKERS_EN_ALL: FrozenSet[str] = frozenset(
+    fold(w) for w in (*getattr(_query, "_STOPWORDS_EN", ()), *getattr(_query, "_QUESTION_WORDS_EN", ())))
+_LANGUAGE_MARKERS_FR: FrozenSet[str] = _MARKERS_FR_ALL - _MARKERS_EN_ALL  # « le », « est », « explique »
+_LANGUAGE_MARKERS_EN: FrozenSet[str] = _MARKERS_EN_ALL - _MARKERS_FR_ALL  # « the », « does », « explain »
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def question_language(text: str) -> Optional[str]:
+    """« fr », « en » ou ``None`` (indécis) : la langue d'une question, d'après ses mots de grammaire et de question
+    propres à une seule langue (« le », « est », « explique » / « the », « does », « explain »)."""
+    tokens = _WORD_RE.findall(fold(text or ""))
+    fr = sum(1 for t in tokens if t in _LANGUAGE_MARKERS_FR)
+    en = sum(1 for t in tokens if t in _LANGUAGE_MARKERS_EN)
+    if fr == en:
+        return None
+    return "fr" if fr > en else "en"
+
+
+def word_names_symbol(word: str, text: str, intent: str = "factual") -> bool:
+    """Vrai si le mot courant ``word`` est **employé comme un nom de code** dans la question ``text``, et désigne
+    donc aussi une méthode / fonction homonyme (``OrderController::confirm``), pas seulement une classe :
+
+    * écrit en appel : « confirm() » ;
+    * annoncé par un mot de code juste avant ou après (:data:`_CODE_CUES_BEFORE` / :data:`_CODE_CUES_AFTER`) :
+      « la méthode confirm », « l'action store », « où est défini confirm », « the confirm method » ;
+    * complément direct d'un verbe d'explication (:data:`_EXPLAIN_VERBS`) : « explique confirm », « que fait
+      store ? », « what does confirm do » ;
+    * mot d'une seule langue dans une question de l'autre (:data:`_COMMON_EN_ONLY` / :data:`_COMMON_FR_ONLY`) :
+      « le code de confirm », « comment marche store » — sauf derrière un déterminant ou un pronom sujet
+      (:data:`_DETERMINERS` : « les logs », « tu put m'expliquer »), derrière un mot de classe, directement ou via
+      « de » (:data:`_CLASS_CUES_BEFORE` : « le modèle User », « la table de user »), et dans une question de
+      structure (``intent == "fields"`` : « quels champs a User ? » vise le modèle, pas les relations ``user()``).
+
+    « explique moi la definition des champs » (« definition », mot des deux langues, derrière « la ») et « peux-tu
+    me décrire le modèle User » (« user », derrière « modèle ») ne nomment pas de méthode."""
+    w = fold(word or "").strip()
+    folded = fold(text or "")
+    if not w or not folded:
+        return False
+    if re.search(r"\b%s\s*\(" % re.escape(w), folded):
+        return True
+    tokens = _WORD_RE.findall(folded)
+    lang = question_language(folded)
+    foreign = intent != "fields" and ((lang == "fr" and w in _COMMON_EN_ONLY) or (lang == "en" and w in _COMMON_FR_ONLY))
+    for i, tok in enumerate(tokens):
+        if tok != w:
+            continue
+        j = i - 1
+        while j >= 0 and tokens[j] in _POLITE_TOKENS:
+            j -= 1
+        prev = tokens[j] if j >= 0 else ""
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if prev in _CODE_CUES_BEFORE or nxt in _CODE_CUES_AFTER or prev in _EXPLAIN_VERBS:
+            return True
+        head = tokens[j - 1] if prev in _PREPOSITIONS and j >= 1 else prev  # « le code de confirm » → « code »
+        if foreign and prev not in _DETERMINERS and head not in _DETERMINERS and head not in _CLASS_CUES_BEFORE:
+            return True
+    return False
+
+
+# Canal « route » : au plus ROUTE_LIMIT routes par terme ; au-delà le terme est trop générique (« api »,
+# « store ») et ne sert qu'à départager ; termes de moins de ROUTE_MIN_TERM_LENGTH caractères ignorés.
+ROUTE_LIMIT = 20
+ROUTE_MIN_TERM_LENGTH = 3
+ROUTE_MAX_TERMS = 16
+ROUTE_GRAPH_SEEDS = 3  # premières routes trouvées qui servent aussi de graines au canal graphe
+# Poids d'une route : 1 + ROUTE_STRONG_STEP par preuve forte (terme égal à un segment du chemin, à l'action, au
+# contrôleur ou à la méthode HTTP), au plus ROUTE_STRONG_MAX preuves → 1,5, comme IDENTIFIER_BONUS.
+ROUTE_STRONG_STEP = 0.125
+ROUTE_STRONG_MAX = 4
+# Fichiers générés volumineux (canal lexical) : seuil de taille et motifs de chemin. Le dossier d'exécution
+# Laravel n'est reconnu que par son nom en minuscules suivi d'un de ses sous-dossiers (``storage/app/``,
+# ``storage/framework/``, ``storage/logs/``…) : un module source nommé ``storage`` (``develop/storage/db.py``,
+# ``src/storage/s3.ts``, ``app/Storage/FileStore.php``) n'est pas un fichier généré.
+GENERATED_FILE_MAX_BYTES = 300_000
+GENERATED_PENALTY = 0.5  # l'apport RRF d'un morceau d'un tel fichier est divisé par deux
+_LARAVEL_STORAGE_DIRS = "app|framework|logs|debugbar|clockwork|pail"
+_GENERATED_PATH_RE = re.compile(
+    r"(?:^|/)api-docs(?:[./]|$)|(?:^|/)(?:swagger|openapi)\.(?:json|ya?ml)$"
+    r"|(?:^|/)(?-i:storage/(?:" + _LARAVEL_STORAGE_DIRS + r")/)|(?:^|/)public/build(?:/|$)"
+    r"|\.lock$|-lock\.(?:json|ya?ml)$|\.min\.[A-Za-z0-9]+$", re.IGNORECASE)
+EXPANSION_MAX_TERMS = 12  # termes d'expansion au plus dans la requête lexicale secondaire
+EXPANSION_LIMIT = 20  # morceaux au plus pour cette requête
 # Repli « faute de frappe » : distance d'édition tolérée selon la longueur (voir :func:`max_edits`).
 FUZZY_MIN_LENGTH = 4  # en dessous, trop de faux positifs : aucune approximation
 FUZZY_MAX_LENGTH = 64  # au-dessus, ce n'est pas un identifiant
@@ -95,20 +277,29 @@ MODEL_WINDOW_LINES = 40
 ENDPOINT_WINDOW_LINES = 3
 MAX_PER_SOURCE = 3  # diversité : morceaux maximum par fichier / document / note
 MAX_GRAPH_SEEDS = 8
+GRAPH_PER_SEED = 10  # candidats au plus par graine au premier tour du canal graphe (aucune graine n'accapare le canal)
+# Fichiers atteints « via imports » depuis le fichier d'une graine (importateurs d'une classe, fichiers importés) :
+# au plus GRAPH_IMPORTS_PER_SEED par graine hors question d'impact (who_calls / impact : les importateurs sont la
+# surface d'impact), après les autres relations de la graine. Leur premier morceau (namespace + use) n'apprend
+# rien : les douze contrôleurs importés par un fichier de routes ou les dix-neuf importateurs d'un modèle
+# rempliraient le contexte d'en-têtes.
+GRAPH_IMPORTS_PER_SEED = 3
+_IMPORT_RELATION_KINDS: FrozenSet[str] = frozenset({"imports", "imports_raw"})
 MAX_FILE_BYTES = 2_000_000
 TEMPORAL_LIMIT = 20
 RECENT_NOTES_LIMIT = 10
 
 # Pondération par canal, ajustée selon l'intention de la question.
-_CHANNEL_WEIGHTS: Dict[str, float] = {"identifier": IDENTIFIER_BONUS, "lexical": 1.0, "semantic": 1.0,
+_CHANNEL_WEIGHTS: Dict[str, float] = {"identifier": IDENTIFIER_BONUS, "route": 1.0, "lexical": 1.0, "semantic": 1.0,
                                       "graph": 1.0, "temporal": 1.0}
 _INTENT_WEIGHTS: Dict[str, Dict[str, float]] = {
     "decision": {"temporal": 1.3},
-    "who_calls": {"graph": 1.2},
+    "who_calls": {"graph": 1.2, "route": 0.5},  # les appelants sont des symboles : les routes homonymes sont secondaires
     "impact": {"graph": 1.2},
-    "fields": {"identifier": 1.7},
+    "fields": {"identifier": 1.7},  # (le canal route est muet pour cette intention, voir ``search``)
+    "howto": {"route": 1.2},  # « comment créer / appeler… » vise souvent une route
 }
-_CHANNEL_PRIORITY = ("identifier", "graph", "lexical", "semantic", "temporal")
+_CHANNEL_PRIORITY = ("identifier", "route", "graph", "lexical", "semantic", "temporal")
 
 _RELATION_LABELS: Dict[str, str] = {
     "imports": "imports", "imports_raw": "imports", "calls": "appels", "calls_endpoint": "appel d'API",
@@ -124,6 +315,110 @@ _WS_RE = re.compile(r"\s+")
 _QUALIFIED_SPLIT_RE = re.compile(r"^([A-Za-z_]\w*)(?:::|->|\.)([A-Za-z_]\w*)$")
 _FILENAME_RE = re.compile(r"^[\w.-]+\.[A-Za-z0-9]{1,12}$")
 _LIKE_ESCAPE = {"\\": "\\\\", "%": "\\%", "_": "\\_"}
+# Gestionnaire de route « Contrôleur@action » (préfixe de namespace toléré ; « closure », « api »… ignorés).
+_HANDLER_RE = re.compile(r"^(?:[\w\\.]*[\\.])?(?P<ctl>[A-Za-z_]\w*?)(?:Controller)?\s*(?:@|::|->|\.)\s*(?P<action>[A-Za-z_]\w*)$")
+_CAMEL_FIRST_RE = re.compile(r"^([A-Z][a-z0-9]*)(.*)$")
+# Action → préfixe canonique des classes de validation Laravel (Store/Update/Index<Modèle>Request).
+_REQUEST_PREFIXES = {"store": "Store", "create": "Store", "update": "Update", "edit": "Update", "patch": "Update",
+                     "index": "Index", "list": "Index", "all": "Index", "getall": "Index", "show": "Show", "get": "Show",
+                     "destroy": "Delete", "delete": "Delete"}
+
+
+_FRENCH_SUFFIXES = ("er", "ir", "re", "es", "s", "e")
+_CAMEL_WORDS_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def handler_words(handler: Optional[str]) -> Set[str]:
+    """Mots (repliés) d'un gestionnaire de route : ``ShipmentController@storeFromOrder`` →
+    {shipment, controller, store, from, order}. Un terme ne « contient » un gestionnaire que mot
+    entier : « orders » ne désigne pas ``OrderService::confirm``."""
+    return {fold(w) for w in _CAMEL_WORDS_RE.findall(handler or "")}
+
+
+def route_contains(e: EndpointRow, term: str, path_only: bool = False) -> bool:
+    """Vrai si ``term`` (replié) est contenu dans le chemin (sous-chaîne), est un mot entier du
+    gestionnaire, ou est la méthode HTTP. Avec ``path_only`` (radical déduit d'un mot-clé, « orders » →
+    ``order``), seul le chemin compte : un radical ne désigne pas ``OrderService::confirm``."""
+    if term in fold(e.normalized_path or "") or term in fold(e.path or ""):
+        return True
+    if path_only:
+        return False
+    return term in handler_words(e.handler) or term == fold(e.method or "")
+
+
+# Partie dynamique d'un chemin d'appel client : variable, interpolation ou expression ($url, ${id}, {$this->baseUrl}).
+_DYNAMIC_PART_RE = re.compile(r"\$\{[^{}]*\}|\$[A-Za-z_]\w*|\{[^{}]*\}")
+
+
+def is_dynamic_client_call(e: EndpointRow) -> bool:
+    """Vrai pour un appel client dont le chemin n'est fait que de variables ou d'expressions (« POST $url »,
+    « {$this->baseUrl}{$endpoint} », « {self::PARTNER_URL} », tous normalisés « / ») : il ne désigne aucune
+    route et ne peut en être une. L'extracteur PHP ne les indexe plus ; un index plus ancien en garde."""
+    if e.side != "client":
+        return False
+    s, prev = e.path or "", None
+    while s != prev:
+        prev, s = s, _DYNAMIC_PART_RE.sub("", s)
+    return not s.strip()
+
+
+def inherited_words(analysis: QueryAnalysis) -> Set[str]:
+    """Mots (repliés) hérités du tour précédent d'une question de suivi qui ne sont **pas** des identifiants :
+    :attr:`QueryAnalysis.previous_terms` moins :attr:`QueryAnalysis.identifiers`, soit les mots d'un titre de
+    document cité et les mots-clés de la question précédente (« formulaires », « commande »). Ils portent le sujet
+    conservé sans le nommer : le moteur ne les essaie pas comme noms nus (canal « identifier ») et ne leur fait
+    pas désigner de route (canal « route », où ils ne font que départager). Un identifiant hérité (« Customer »,
+    « Shipment », le radical du fichier cité) reste un nom à part entière."""
+    return {fold(p) for p in analysis.previous_terms} - {fold(i) for i in analysis.identifiers}
+
+
+def _french_stem(word: str) -> str:
+    """Radical d'un mot replié sans sa désinence (« confirmer » → ``confirm``, « commandes » →
+    ``commande``), s'il garde au moins quatre caractères ; ``""`` sinon."""
+    for suffix in _FRENCH_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[:-len(suffix)]
+    return ""
+
+
+def is_generated_file(path: Optional[str], size: Optional[int]) -> bool:
+    """Fichier généré ou volumineux qui monopolise le canal lexical sans rien expliquer : plus de
+    :data:`GENERATED_FILE_MAX_BYTES` (dumps SQL, exports…) ou chemin typique (``api-docs``,
+    ``swagger.json`` / ``openapi.json``, ``*.lock``, ``*.min.*``, ``public/build``, dossier d'exécution
+    Laravel ``storage/app/`` / ``storage/framework/`` / ``storage/logs/``…). Un dossier source nommé
+    ``storage`` (``develop/storage/db.py``, ``src/storage/s3.ts``, ``app/Storage/FileStore.php``) n'en est pas un."""
+    if size is not None and int(size) > GENERATED_FILE_MAX_BYTES:
+        return True
+    p = (path or "").replace("\\", "/")
+    return bool(p) and _GENERATED_PATH_RE.search(p) is not None
+
+
+def request_class_names(handler: Optional[str]) -> List[str]:
+    """Noms possibles, par priorité, de la classe de validation d'un gestionnaire « Contrôleur@action » :
+    ``<Action><Base>Request``, ``<Premier mot><Base><Reste>Request`` (``storeFromOrder`` →
+    ``StoreShipmentFromOrderRequest``), ``<Base><Action>Request``, le préfixe canonique
+    (``Store|Update|Index|Show|Delete<Base>Request``) et ``<Base>Request``. Vide sans gestionnaire exploitable."""
+    m = _HANDLER_RE.match((handler or "").strip())
+    if not m:
+        return []
+    base, action = m.group("ctl"), m.group("action")
+    if not base or not action:
+        return []
+    act = action[0].upper() + action[1:]
+    names = [act + base + "Request"]
+    cm = _CAMEL_FIRST_RE.match(act)
+    if cm and cm.group(2):
+        names.append(cm.group(1) + base + cm.group(2) + "Request")
+    names.append(base + act + "Request")
+    prefix = _REQUEST_PREFIXES.get(action.lower())
+    if prefix:
+        names += [prefix + base + "Request", base + prefix + "Request"]
+    names.append(base + "Request")
+    out: List[str] = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return out
 
 
 def _normalize_route(path: str) -> str:
@@ -337,6 +632,32 @@ class _Loader:
         self._docs: Dict[int, Optional[DocumentRow]] = {}
         self._notes: Dict[int, Optional[NoteRow]] = {}
         self._lines: Dict[int, Optional[List[str]]] = {}
+        self._request_classes: Dict[str, Optional[Tuple[int, str, Optional[int]]]] = {}
+
+    def request_class(self, handler: Optional[str]) -> Optional[Tuple[int, str, Optional[int]]]:
+        """``(id, nom, file_id)`` de la classe de validation (FormRequest) du gestionnaire, parmi
+        :func:`request_class_names`, ou ``None``."""
+        key = (handler or "").strip()
+        if not key:
+            return None
+        if key in self._request_classes:
+            return self._request_classes[key]
+        found: Optional[Tuple[int, str, Optional[int]]] = None
+        names = request_class_names(key)
+        if names:
+            ph = ",".join("?" * len(names))
+            try:
+                rows = self.db.query("SELECT id, name, file_id FROM symbols WHERE name IN (%s) "
+                                     "AND lower(coalesce(kind, '')) = 'class' ORDER BY id" % ph, names)
+            except Exception:  # noqa: BLE001
+                rows = []
+            by_name = {str(r["name"]): (int(r["id"]), str(r["name"]), _as_int(r["file_id"])) for r in rows}
+            for n in names:
+                if n in by_name:
+                    found = by_name[n]
+                    break
+        self._request_classes[key] = found
+        return found
 
     def repos(self) -> Dict[str, RepoRow]:
         if self._repos is None:
@@ -474,16 +795,26 @@ class SearchEngine:
 
         per_channel: Dict[str, List[_Candidate]] = {}
         ident_cands: List[_Candidate] = []
+        route_cands: List[_Candidate] = []
         if "identifier" in wanted:
             ident_cands = self._run(result, "identifier", lambda: self._channel_identifier(analysis, allowed))
             per_channel["identifier"] = ident_cands
+        if "route" in wanted and "endpoint" in allowed and analysis.intent != "fields":
+            # une question de structure (« quels champs a la table orders ») ne vise pas une route : canal muet
+            route_cands = self._run(result, "route", lambda: self._channel_route(analysis))
+            per_channel["route"] = route_cands
         if "lexical" in wanted and chunk_types:
-            per_channel["lexical"] = self._run(result, "lexical", lambda: self._channel_lexical(analysis, chunk_types))
+            per_channel["lexical"] = self._run(result, "lexical",
+                                               lambda: self._channel_lexical(analysis, chunk_types, loader))
         if "semantic" in wanted and chunk_types:
             per_channel["semantic"] = self._run(result, "semantic",
                                                 lambda: self._channel_semantic(query_vector, chunk_types, result))
         if "graph" in wanted:
-            per_channel["graph"] = self._run(result, "graph", lambda: self._channel_graph(analysis, ident_cands, allowed))
+            # Les premières routes sont des graines à part entière, avant le reste des identifiants : le
+            # gestionnaire d'une route trouvée (« handles ») vaut autant qu'un dixième modèle homonyme.
+            keep = max(0, MAX_GRAPH_SEEDS - ROUTE_GRAPH_SEEDS)
+            seeds = ident_cands[:keep] + route_cands[:ROUTE_GRAPH_SEEDS] + ident_cands[keep:]
+            per_channel["graph"] = self._run(result, "graph", lambda: self._channel_graph(analysis, seeds, allowed))
         if "temporal" in wanted and "note" in allowed:
             per_channel["temporal"] = self._run(result, "temporal", lambda: self._channel_temporal(analysis))
         if not any(per_channel.values()) and "identifier" in wanted and "symbol" in allowed:
@@ -501,6 +832,8 @@ class SearchEngine:
         hits = self._materialize(fused, loader)
         hits = [h for h in hits if h.source_type in allowed]
         hits = self._dedupe_and_diversify(hits)
+        if analysis.intent not in ("who_calls", "impact"):
+            hits = self._server_routes_first(hits)
         result.hits = hits[:limit_n]
         return result
 
@@ -777,6 +1110,52 @@ class SearchEngine:
                 out.append(_Candidate(("model", m.id), "table exacte « %s »" % name, "model", row=m))
         return out[:limit]
 
+    def _class_candidates(self, name: str, limit: int = 20) -> List[_Candidate]:
+        """Symboles de nom exact ``name`` dont le genre est une classe / interface / modèle
+        (:data:`CLASS_KINDS`) : ce qu'un mot courant (« user », « document ») a le droit de désigner."""
+        kinds = sorted(CLASS_KINDS)
+        ph = ",".join("?" * len(kinds))
+        rows = self.db.query("SELECT * FROM symbols WHERE lower(name) = ? AND lower(coalesce(kind, '')) IN (%s) "
+                             "ORDER BY length(name), id LIMIT ?" % ph, [fold(name), *kinds, int(limit)])
+        return [_Candidate(("symbol", s.id), "nom de classe exact « %s »" % name, "symbol", row=s)
+                for s in (SymbolRow.from_row(r) for r in rows) if s.id is not None]
+
+    def _member_candidates(self, name: str, parents: Set[str], limit: int = 20) -> List[_Candidate]:
+        """Membres de nom exact ``name`` d'une des classes ``parents`` (repliées) citées dans la même
+        question : « OrderService confirm » désigne bien ``OrderService::confirm``."""
+        if not parents:
+            return []
+        owners = sorted(parents)
+        ph = ",".join("?" * len(owners))
+        rows = self.db.query("SELECT * FROM symbols WHERE lower(name) = ? AND lower(coalesce(parent, '')) IN (%s) "
+                             "ORDER BY id LIMIT ?" % ph, [fold(name), *owners, int(limit)])
+        out: List[_Candidate] = []
+        for s in (SymbolRow.from_row(r) for r in rows):
+            if s.id is not None:
+                out.append(_Candidate(("symbol", s.id), "membre « %s » de la classe citée %s" % (name, s.parent),
+                                      "symbol", row=s))
+        return out
+
+    def _bare_symbol_candidates(self, word: str, analysis: QueryAnalysis, parents: Set[str],
+                                limit: int = 30) -> List[_Candidate]:
+        """Symboles de nom exact ``word``, avec la règle des mots courants : un mot sans forme de code ni
+        accents graves qui est un mot de la langue (:func:`is_common_word` : « definition », « put »,
+        « user ») ne désigne qu'une classe / un modèle (:meth:`_class_candidates`) ou un membre d'une
+        classe citée dans la question (:meth:`_member_candidates`) ; ses méthodes homonymes
+        (``UserFactory::definition``, ``Cache::put``) ne sont jamais remontées (poids nul). Exceptions :
+        une question d'appelants ou d'impact (« qui appelle confirm ? », « si je modifie confirm »)
+        **nomme** un symbole, et une question qui **emploie le mot comme un nom de code**
+        (:func:`word_names_symbol` : « que fait la méthode confirm ? », « explique confirm », « où est
+        défini store ? ») demande bien la méthode — les actions des contrôleurs sont presque toutes des
+        mots courants ; le mot est alors pris tel quel. Dans les deux cas, si une classe citée possède le
+        membre (« la méthode store de ShipmentController »), c'est lui que la question nomme : les autres
+        homonymes (trente ``store``) ne sont pas remontés."""
+        names_code = analysis.intent in ("who_calls", "impact")
+        if (names_code or has_code_shape(word) or ("`%s`" % word) in analysis.text or not is_common_word(word)
+                or word_names_symbol(word, analysis.text, analysis.intent)):
+            return self._member_candidates(word, parents, limit=limit) or self._symbol_candidates(word, limit=limit)
+        return self._class_candidates(word, limit=limit) + self._member_candidates(word, parents, limit=limit)
+
     def _file_candidates(self, suffix: str, reason: str, limit: int = 10) -> List[_Candidate]:
         rel = suffix.replace("\\", "/").strip().lstrip("./").strip("/")
         if not rel:
@@ -810,16 +1189,21 @@ class SearchEngine:
         simple = [i for i in analysis.identifiers if not _QUALIFIED_SPLIT_RE.match(i) and not _FILENAME_RE.match(i)]
         filenames = [i for i in analysis.identifiers if _FILENAME_RE.match(i) and "/" not in i]
         # Mots-clés nus (« confirm », « orderservice ») essayés comme noms exacts, en nombre borné ; les mots
-        # génériques (:data:`BARE_EXCLUDED_WORDS` : « table », « model »…) sont écartés.
+        # génériques (:data:`BARE_EXCLUDED_WORDS` : « table », « model »…) sont écartés, et les mots hérités du
+        # tour précédent (:func:`inherited_words`) aussi : « commande » d'un titre cité n'est pas un nom que
+        # l'utilisateur a tapé (il ramenait le modèle Commande et sa migration devant le document cité) ; un modèle
+        # que le tour précédent a réellement cité est dans le marqueur par son libellé, un identifiant.
         tried = {fold(i) for i in analysis.identifiers} | {fold(t) for t in analysis.tables}
+        inherited = inherited_words(analysis)
         bare: List[str] = []
         for k in analysis.keywords:
             fk = fold(k)
-            if len(k) >= 3 and fk not in tried and fk not in BARE_EXCLUDED_WORDS and len(bare) < 8:
+            if len(k) >= 3 and fk not in tried and fk not in BARE_EXCLUDED_WORDS and fk not in inherited and len(bare) < 8:
                 tried.add(fk)
                 bare.append(k)
 
         matched: Set[str] = set()  # identifiants (repliés) ayant trouvé au moins une correspondance exacte
+        cited_classes: Set[str] = set()  # classes trouvées (repliées) : leurs membres homonymes de mots courants comptent
 
         def push(cands: List[_Candidate], weight: float, ident: Optional[str] = None) -> None:
             if cands and ident:
@@ -827,6 +1211,8 @@ class SearchEngine:
             for c in cands:
                 c.weight = weight
                 out.append(c)
+                if c.kind == "symbol" and isinstance(c.row, SymbolRow) and (c.row.kind or "").lower() in CLASS_KINDS:
+                    cited_classes.add(fold(c.row.name))
 
         # --- palier 1 : mentions explicites (Classe::membre, routes, chemins)
         if "symbol" in allowed:
@@ -842,7 +1228,7 @@ class SearchEngine:
         seen_models: Set[str] = set()
         if "symbol" in allowed:
             for ident in simple:
-                push(self._symbol_candidates(ident), W_NAMED, ident)
+                push(self._bare_symbol_candidates(ident, analysis, cited_classes), W_NAMED, ident)
         if "model" in allowed:
             for name in list(analysis.tables) + simple:
                 if fold(name) not in seen_models:
@@ -867,25 +1253,44 @@ class SearchEngine:
                 % (ph, ph), glued + glued)
             push([_Candidate(("model", m.id), "mots collés « %s »" % m.name, "model", row=m)
                   for m in (ModelRow.from_row(r) for r in rows) if m.id is not None], W_NAMED)
-        # --- palier 3 : mots nus et radicaux de fichiers
+        # --- palier 3 : mots nus, termes d'expansion (classes et modèles seulement) et radicaux de fichiers
         if "symbol" in allowed:
             for k in bare:
-                push(self._symbol_candidates(k), W_BARE)
+                push(self._bare_symbol_candidates(k, analysis, cited_classes), W_BARE)
         if "model" in allowed:
             for k in bare:
                 if fold(k) not in seen_models:
                     seen_models.add(fold(k))
                     push(self._model_candidates(k), W_BARE)
+        expansions = [t for t in analysis.expansions if len(t) >= 3 and fold(t) not in tried][:8]
+        for t in expansions:
+            tried.add(fold(t))
+            if "symbol" in allowed:
+                push(self._class_candidates(t), W_BARE)
+            if "model" in allowed and fold(t) not in seen_models:
+                seen_models.add(fold(t))
+                # un terme déduit (« shipments ») : un modèle par fichier suffit, pas chaque Schema::table d'une migration
+                seen_files: Set[Optional[int]] = set()
+                cands = []
+                for c in self._model_candidates(t):
+                    fid = getattr(c.row, "file_id", None)
+                    if fid not in seen_files:
+                        seen_files.add(fid)
+                        cands.append(c)
+                push(cands, W_BARE)
         if "file" in allowed:
             for ident in simple:
                 if len(ident) >= 3:
                     push(self._file_stem_candidates(ident), W_BARE, ident)
         # --- palier 4 : orthographe approchée (repli « faute de frappe ») des identifiants restés sans
         # correspondance : « confrimOrder » → confirmOrder, « OrderServce::confrim » → OrderService::confirm.
+        # Un mot courant sans forme de code (« Garde », « Definition ») n'est pas une faute de frappe.
         if "symbol" in allowed:
             attempts = 0
             for ident in qualified + simple:
                 if fold(ident) in matched or attempts >= FUZZY_MAX_IDENTS:
+                    continue
+                if not has_code_shape(ident) and is_common_word(ident) and analysis.intent not in ("who_calls", "impact"):
                     continue
                 attempts += 1
                 cands = self._fuzzy_symbol_candidates(ident)
@@ -905,6 +1310,8 @@ class SearchEngine:
             fk = fold(k)
             if fk in tried or fk in BARE_EXCLUDED_WORDS or len(fuzzy_key(k)) < FUZZY_MIN_LENGTH:
                 continue
+            if is_common_word(k):
+                continue  # un mot de la langue (« definition », « garde ») n'est pas une faute de frappe d'identifiant
             tried.add(fk)
             attempts += 1
             if attempts > FUZZY_MAX_IDENTS:
@@ -934,7 +1341,8 @@ class SearchEngine:
 
     @staticmethod
     def _glued_names(keywords: List[str]) -> List[str]:
-        """Candidats « mots collés » : tous les mots-clés joints (jusqu'à 4) et chaque paire adjacente."""
+        """Candidats « mots collés » : tous les mots-clés joints (jusqu'à 4), puis chaque paire et chaque
+        triplet de mots adjacents (``order line`` → ``orderline``, ``order line item`` → ``orderlineitem``)."""
         words = [re.sub(r"[^a-z0-9]", "", fold(k)) for k in keywords]
         words = [w for w in words if w]
         if len(words) < 2:
@@ -944,6 +1352,8 @@ class SearchEngine:
             glued.append("".join(words))
         for a, b in zip(words, words[1:]):
             glued.append(a + b)
+        for a, b, c in zip(words, words[1:], words[2:]):
+            glued.append(a + b + c)
         out: List[str] = []
         for w in glued:
             if len(w) >= 4 and w not in out:
@@ -951,20 +1361,219 @@ class SearchEngine:
         return out
 
     # ------------------------------------------------------------------ canal lexical
-    def _channel_lexical(self, analysis: QueryAnalysis, chunk_types: List[str]) -> List[_Candidate]:
-        q = analysis.lexical_query or analysis.text
-        if not q.strip():
-            return []
+    def _channel_lexical(self, analysis: QueryAnalysis, chunk_types: List[str], loader: _Loader) -> List[_Candidate]:
+        """Mots-clés (ET, puis OU en repli — :meth:`Database.fts_search`), puis les termes d'expansion en
+        OU à :data:`W_EXPANSION` ; dans chaque liste, les morceaux de fichiers générés volumineux sont
+        pénalisés (:func:`is_generated_file`).
+
+        Pour une question de suivi, la requête principale ne porte que les mots de la question elle-même : les
+        termes hérités du tour précédent (:attr:`QueryAnalysis.previous_terms`, identifiants et libellés de
+        sources compris) forment une requête secondaire en OU à :data:`W_PREVIOUS`, car exigés en ET ils
+        filtraient : « explique-moi la définition des champs » après le document « Paramétrage des formulaires
+        de commande » n'acceptait plus que le seul fichier contenant tous les mots du marqueur (« contenu »,
+        « configuration », « commandes »…), et le document, premier quand la question est posée seule, disparaissait
+        du canal. Un morceau trouvé par les deux requêtes (les mots de la question **et** le sujet précédent) garde
+        son rang de la requête principale avec les deux poids additionnés (un canal ne compte un morceau qu'une
+        fois, voir :meth:`_run`) : il passe devant les morceaux des seuls mots de la question. Sans mot propre à la
+        question (« et alors ? », mots vides), les termes hérités restent la requête principale."""
         out: List[_Candidate] = []
-        query_terms = fts_terms(q)  # exactement ce que ``Database.fts_search`` cherche
-        for h in self.db.fts_search(q, limit=CHANNEL_LIMIT, source_types=chunk_types):
-            terms = lexical_terms_found(h.snippet or "", query_terms)
+        previous = [t for t in analysis.previous_terms if t]
+        own = [k for k in analysis.keywords if k not in previous] if previous else list(analysis.keywords)
+        q = " ".join(own) or analysis.lexical_query or analysis.text
+        if q.strip():
+            query_terms = fts_terms(q)  # exactement ce que ``Database.fts_search`` cherche
+            hits = self.db.fts_search(q, limit=CHANNEL_LIMIT * 2, source_types=chunk_types)
+            out.extend(self._lexical_candidates(hits, query_terms, loader, 1.0, "correspondance lexicale"))
+        if previous and own:
+            terms: List[str] = []
+            for t in fts_terms(" ".join(previous)):  # un libellé à tirets donne ses mots, sans doublon
+                if t not in terms:
+                    terms.append(t)
+            terms = terms[:EXPANSION_MAX_TERMS]
             if terms:
-                reason = "correspondance lexicale sur %s" % ", ".join("« %s »" % t for t in terms[:3])
-            else:
-                reason = "correspondance lexicale"
-            out.append(_Candidate(("chunk", int(h.chunk_id)), reason, "chunk", chunk_id=int(h.chunk_id),
-                                  extra={"fts_score": round(float(h.score), 4), "fts_terms": terms[:5]}))
+                hits = self._fts_or(terms, EXPANSION_LIMIT, chunk_types)
+                cands = self._lexical_candidates(hits, terms, loader, W_PREVIOUS,
+                                                 "correspondance lexicale avec le tour précédent")
+                both = {c.key: c for c in cands}
+                for c in out:
+                    hit = both.pop(c.key, None)
+                    if hit is not None:
+                        c.weight += hit.weight
+                        found = [str(t) for t in hit.extra.get("fts_terms") or []][:3]
+                        c.reason += " ; avec le tour précédent" + (" sur %s" % ", ".join("« %s »" % t for t in found)
+                                                                  if found else "")
+                        c.extra["previous"] = True
+                for c in cands:
+                    if c.key in both:
+                        c.extra["previous"] = True
+                        out.append(c)
+        expansions = [t for t in analysis.expansions if len(t) >= 2][:EXPANSION_MAX_TERMS]
+        if expansions:
+            hits = self._fts_or(expansions, EXPANSION_LIMIT, chunk_types)
+            out.extend(self._lexical_candidates(hits, expansions, loader, W_EXPANSION,
+                                                "correspondance lexicale élargie", expanded=True))
+        return out
+
+    def _fts_or(self, terms: List[str], limit: int, chunk_types: List[str]) -> List[FtsHit]:
+        """Requête FTS5 en OU (sans préfixe) sur ``terms`` ; ``[]`` sur requête vide ou invalide."""
+        match = build_fts_query(" ".join(terms), "OR", prefix_last=False)
+        if not match or limit <= 0 or not chunk_types:
+            return []
+        sql = ("SELECT chunks_fts.rowid AS chunk_id, bm25(chunks_fts) AS score, "
+               "snippet(chunks_fts, 0, '[', ']', '…', 12) AS snippet, c.source_type AS source_type, "
+               "c.source_id AS source_id FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
+               "WHERE chunks_fts MATCH ? AND c.source_type IN (%s) ORDER BY bm25(chunks_fts), chunks_fts.rowid LIMIT ?"
+               % ",".join("?" * len(chunk_types)))
+        try:
+            rows = self.db.query(sql, [match, *chunk_types, int(limit)])
+        except sqlite3.OperationalError:
+            return []
+        return [FtsHit(chunk_id=int(r["chunk_id"]), score=-float(r["score"]), snippet=r["snippet"] or "",
+                       source_type=r["source_type"], source_id=r["source_id"]) for r in rows]
+
+    def _lexical_candidates(self, hits: List[FtsHit], terms: Sequence[str], loader: _Loader, weight: float,
+                            label: str, expanded: bool = False) -> List[_Candidate]:
+        """Candidats d'une liste FTS, dans l'ordre BM25, avec la pénalité des fichiers générés volumineux :
+        apport × :data:`GENERATED_PENALTY`, raison « fichier généré volumineux », et un seul morceau par
+        tel fichier en tête de liste (les suivants sont renvoyés en queue, après les autres morceaux)."""
+        loader.preload_files(int(h.source_id) for h in hits if h.source_type == "file" and h.source_id is not None)
+        head: List[_Candidate] = []
+        deferred: List[_Candidate] = []
+        seen_generated: Set[int] = set()
+        for h in hits:
+            found = lexical_terms_found(h.snippet or "", terms)
+            reason = ("%s sur %s" % (label, ", ".join("« %s »" % t for t in found[:3]))) if found else label
+            extra: Dict[str, Any] = {"fts_score": round(float(h.score), 4), "fts_terms": found[:5]}
+            if expanded:
+                extra["expanded"] = True
+            cand = _Candidate(("chunk", int(h.chunk_id)), reason, "chunk", chunk_id=int(h.chunk_id), weight=weight,
+                              extra=extra)
+            f = loader.file(int(h.source_id)) if h.source_type == "file" and h.source_id is not None else None
+            if f is not None and f.id is not None and is_generated_file(f.path, f.size):
+                cand.weight = weight * GENERATED_PENALTY
+                cand.reason += " (fichier généré volumineux)"
+                cand.extra["generated"] = True
+                if int(f.id) in seen_generated:
+                    deferred.append(cand)
+                    continue
+                seen_generated.add(int(f.id))
+            head.append(cand)
+        return head + deferred
+
+    # ------------------------------------------------------------------ canal route
+    def _route_terms(self, analysis: QueryAnalysis) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, bool]]]:
+        """``(termes, départage)`` : termes cherchés dans les routes, avec un drapeau « radical » : mots-clés et
+        leur radical sans désinence française (« confirmer » → ``confirm``, « commandes » → ``commande`` ; un
+        radical n'est cherché que dans le chemin), mots collés puis expansions (repliés, ≥ 3 caractères, sans
+        doublon), hors termes déjà présents dans une route ou un chemin cité explicitement (le canal
+        « identifier » les sert à l'exact, avec la méthode).
+
+        Les mots **hérités du tour précédent** (:attr:`QueryAnalysis.previous_terms`) qui ne sont pas des
+        identifiants — mots d'un titre de document cité, mots-clés de la question précédente (« formulaires »,
+        « commande ») — ne désignent aucune route : avec leurs radicaux et mots collés, ils forment la seconde liste,
+        qui ne sert qu'à départager les routes trouvées par la question elle-même. Sinon « explique-moi la
+        définition des champs » après le document « Paramétrage des formulaires de commande » ramenait GET /commandes,
+        POST /commandes… devant le document. Un identifiant hérité (« Customer », « Shipment ») reste un terme à part
+        entière : c'est le sujet conservé."""
+        explicit = [fold(r) for r in list(analysis.routes) + list(analysis.paths)]
+        inherited = inherited_words(analysis)
+        own = [k for k in analysis.keywords if fold(k) not in inherited]
+        previous = [k for k in analysis.keywords if fold(k) in inherited]
+        seen: Set[str] = set()
+
+        def collect(keywords: List[str], expansions: List[str]) -> List[Tuple[str, bool]]:
+            raw_terms: List[Tuple[str, bool]] = []
+            for k in keywords:
+                raw_terms.append((k, False))
+                stem = _french_stem(fold(k))
+                if stem:
+                    raw_terms.append((stem, True))
+            raw_terms += [(g, False) for g in self._glued_names(keywords)]
+            raw_terms += [(x, False) for x in expansions]
+            out: List[Tuple[str, bool]] = []
+            for raw, derived in raw_terms:
+                t = re.sub(r"[^a-z0-9_-]", "", fold(raw))
+                if len(t) < ROUTE_MIN_TERM_LENGTH or t in seen or any(t in e for e in explicit):
+                    continue
+                seen.add(t)
+                out.append((t, derived))
+                if len(out) >= ROUTE_MAX_TERMS:
+                    break
+            return out
+
+        terms = collect(own, list(analysis.expansions))
+        return terms, collect(previous, [])
+
+    def _channel_route(self, analysis: QueryAnalysis) -> List[_Candidate]:
+        """Endpoints dont ``normalized_path``, ``path`` ou ``handler`` contient un terme (LIKE, casse
+        ignorée, :data:`ROUTE_LIMIT` routes au plus par terme). Un terme présent dans plus de
+        :data:`ROUTE_LIMIT` routes (« api », « store ») ne produit pas de candidat, pas plus qu'un mot hérité
+        du tour précédent (voir :meth:`_route_terms`) : ils ne font que départager ceux trouvés par un terme
+        précis. Un appel client dont le chemin n'est qu'une variable (« POST $url », voir
+        :func:`is_dynamic_client_call`) est ignoré. Classement : preuves fortes (terme égal à un segment du
+        chemin, à l'action, au contrôleur ou à la méthode), puis route serveur avant appel client (un appel
+        consomme une route, il ne la définit pas), puis terme égal à un segment, nombre de termes contenus,
+        chemin le plus court."""
+        terms, inherited = self._route_terms(analysis)
+        if not terms:
+            return []
+        rows: Dict[int, EndpointRow] = {}
+        matched: Dict[int, List[str]] = {}
+        qualifiers: List[Tuple[str, bool]] = list(inherited)
+        for t, derived in terms:
+            like = "%" + _like_escape(t) + "%"
+            # préfiltre SQL (sous-chaîne), puis règle exacte de :func:`route_contains` (mot entier du gestionnaire)
+            found = [e for e in (EndpointRow.from_row(r) for r in self.db.query(
+                "SELECT * FROM endpoints WHERE lower(coalesce(normalized_path, '')) LIKE ? ESCAPE '\\' "
+                "OR lower(coalesce(path, '')) LIKE ? ESCAPE '\\' OR lower(coalesce(handler, '')) LIKE ? ESCAPE '\\' "
+                "ORDER BY side, length(coalesce(normalized_path, '')), id LIMIT ?",
+                (like, like, like, 2 * ROUTE_LIMIT + 1)))
+                     if e.id is not None and route_contains(e, t, derived) and not is_dynamic_client_call(e)]
+            if len(found) > ROUTE_LIMIT:
+                qualifiers.append((t, derived))
+                continue
+            for e in found[:ROUTE_LIMIT]:
+                rows.setdefault(int(e.id), e)  # type: ignore[arg-type]
+                matched.setdefault(int(e.id), []).append(t)  # type: ignore[arg-type]
+        # Un mot d'action seul (« crée » → create/store/post/new, « lister » → index…) trouve les routes de création ou
+        # de listage de TOUTES les entités (GET /persons/create, GET /documents/create…). Dès qu'un terme précis a
+        # trouvé des routes, celles qui ne tiennent qu'à un mot d'action sont écartées ; sans terme précis, elles restent.
+        if any(any(t not in ACTION_TERMS for t in found) for found in matched.values()):
+            for eid in [eid for eid, found in matched.items() if all(t in ACTION_TERMS for t in found)]:
+                rows.pop(eid, None)
+                matched.pop(eid, None)
+        if not rows:
+            return []
+
+        def parts(e: EndpointRow) -> Set[str]:
+            """Preuves fortes possibles : segments du chemin, mots du gestionnaire, méthode HTTP (« crée » → POST)."""
+            segs = {s for s in fold(e.normalized_path or "").split("/") if s}
+            segs |= handler_words(e.handler)
+            if e.method:
+                segs.add(fold(e.method))
+            return segs
+
+        ranked: List[Tuple[int, int, int, int, int, int, EndpointRow, List[str], int]] = []
+        for eid, e in rows.items():
+            found = list(matched[eid]) + [q for q, derived in qualifiers if route_contains(e, q, derived)]
+            # un radical et son mot entier (« shipment » / « shipments ») sont une seule preuve : on garde le plus long
+            found = [t for t in found if not any(o != t and o.startswith(t) for o in found)]
+            strong = len(parts(e) & set(found))
+            # à preuves fortes égales, la route serveur avant l'appel client (le fetch() d'une vue qui vise
+            # POST login n'est pas l'API d'authentification), puis un terme qui est un segment du chemin (l'identité
+            # de la route) prime sur un mot du gestionnaire : « auth login » désigne /auth/login avant
+            # PartnerAuthController@login
+            in_path = len({s for s in fold(e.normalized_path or "").split("/") if s} & set(found))
+            ranked.append((-strong, 0 if e.side == "server" else 1, -in_path, -len(found), len(e.normalized_path or ""),
+                           eid, e, found, strong))
+        ranked.sort(key=lambda t: t[:6])
+        out: List[_Candidate] = []
+        for _, _, _, _, _, eid, e, found, strong in ranked:
+            reason = "route contenant %s" % ", ".join("« %s »" % t for t in found[:3])
+            # jusqu'à quatre preuves fortes : une route désignée par son segment, son action et sa méthode pèse 1,5
+            weight = 1.0 + ROUTE_STRONG_STEP * min(strong, ROUTE_STRONG_MAX)
+            out.append(_Candidate(("endpoint", eid), reason, "endpoint", row=e, weight=weight,
+                                  extra={"route_terms": found[:5], "route_strong": strong}))
         return out
 
     # ------------------------------------------------------------------ canal sémantique
@@ -1052,42 +1661,66 @@ class SearchEngine:
                 seen_nodes.add(key)
                 target.append((key, label, min(1.0, weight)))
 
+        # Question d'impact (« qui appelle / utilise… ») : les relations entrantes d'abord, et les importateurs
+        # du fichier d'un modèle ou d'une classe sont la surface d'impact (aucune limite « via imports »).
+        impact = analysis.intent in ("who_calls", "impact")
+        # Fichiers des modèles trouvés : ils ne sont des graines que pour une question d'impact, qu'ils soient
+        # atteints par le modèle, par sa classe homonyme ou par un mot nu égal à leur nom (« User » → User.php).
+        model_files: Set[int] = {int(c.row.file_id) for c in seeds
+                                 if c.kind == "model" and isinstance(c.row, ModelRow) and c.row.file_id is not None}
         for c in seeds:
             if c.kind == "symbol" and isinstance(c.row, SymbolRow):
                 label = ("%s::%s" % (c.row.parent, c.row.name)) if c.row.parent else c.row.name
                 add_seed(node_key("symbol", c.key[1]), label, c.weight, seed_nodes)
-                if c.row.file_id is not None:
+                # Seul un symbole de premier niveau (classe, fonction) apporte son fichier : ses importateurs
+                # l'utilisent. Le fichier d'une méthode n'est relié qu'à sa classe, déjà graine si elle est citée.
+                if c.row.file_id is not None and not c.row.parent and (impact or c.row.file_id not in model_files):
                     add_seed(node_key("file", c.row.file_id), label, c.weight, file_seeds)
             elif c.kind == "endpoint" and isinstance(c.row, EndpointRow):
                 label = ("%s %s" % (c.row.method or "", c.row.path or "")).strip()
                 add_seed(node_key("endpoint", c.key[1]), label, c.weight, seed_nodes)
-                if c.row.file_id is not None:
-                    add_seed(node_key("file", c.row.file_id), label, c.weight, file_seeds)
+                # Jamais le fichier de routes : ses imports sont tous les contrôleurs du module, pas celui de
+                # la route (atteint par ``handles`` depuis le noeud endpoint).
             elif c.kind == "model" and isinstance(c.row, ModelRow):
                 add_seed(node_key("model", c.key[1]), c.row.name, c.weight, seed_nodes)
                 if c.row.table_name:
                     add_seed(node_key("table", str(c.row.table_name).strip().lower()), c.row.table_name, c.weight,
                              seed_nodes)
-                if c.row.file_id is not None:
+                # Le fichier du modèle (→ requêtes, politiques, fournisseurs, tests qui l'importent) ne sert
+                # qu'à une question d'impact ; le noeud modèle porte déjà ``uses_model``, ``documented_by``…
+                if impact and c.row.file_id is not None:
                     add_seed(node_key("file", c.row.file_id), c.row.name, c.weight, file_seeds)
             elif c.kind in ("file", "chunk") and isinstance(c.row, FileRow) and c.row.id is not None:
-                add_seed(node_key("file", c.row.id), os.path.basename(c.row.path), c.weight, file_seeds)
+                # Un fichier que la question nomme (chemin ou nom de fichier, poids ≥ W_NAMED) ; pas un mot nu qui
+                # se trouve être le radical d'un nom de fichier (« Shipment » → Shipment.php, poids W_BARE).
+                if impact or (c.weight >= W_NAMED and c.row.id not in model_files):
+                    add_seed(node_key("file", c.row.id), os.path.basename(c.row.path), c.weight, file_seeds)
         for t in analysis.tables:
             add_seed(node_key("table", t.lower()), t, W_NAMED, seed_nodes)
         seed_nodes = seed_nodes + file_seeds
         if not seed_nodes:
             return []
 
-        incoming_first = analysis.intent in ("who_calls", "impact")
-        out: List[_Candidate] = []
+        # Chaque graine apporte au plus GRAPH_PER_SEED candidats au premier tour (dans l'ordre des graines :
+        # éléments exacts, premières routes, puis fichiers), le reste suit : un modèle utilisé par quarante
+        # fichiers n'étouffe pas le gestionnaire d'une route trouvée après lui.
+        per_seed: List[List[_Candidate]] = []
+        total = 0
         for key, label, weight in seed_nodes:
             rels_in = self.db.relations_to(key)
             rels_out = self.db.relations_from(key)
-            ordered = (rels_in + rels_out) if incoming_first else (rels_out + rels_in)
-            ordered.sort(key=lambda r: -float(r.confidence or 0.0))
+            ordered = (rels_in + rels_out) if impact else (rels_out + rels_in)
+            # confiance décroissante ; les arêtes imports d'un fichier après ses autres relations
+            # (gestionnaire, modèle, documentation, mentions), et au plus GRAPH_IMPORTS_PER_SEED hors impact
+            ordered.sort(key=lambda r: (r.kind in _IMPORT_RELATION_KINDS, -float(r.confidence or 0.0)))
+            cands: List[_Candidate] = []
+            imported = 0
             for rel in ordered:
                 other = rel.src if rel.dst == key else rel.dst
                 if other == key:
+                    continue
+                is_import = rel.kind in _IMPORT_RELATION_KINDS
+                if is_import and not impact and imported >= GRAPH_IMPORTS_PER_SEED:
                     continue
                 reason = "relié à %s via %s" % (label, _RELATION_LABELS.get(rel.kind, rel.kind))
                 cand = self._candidate_for_node(other, reason, allowed)
@@ -1095,9 +1728,20 @@ class SearchEngine:
                     cand.weight = weight
                     cand.extra["relation"] = rel.kind
                     cand.extra["via"] = label
-                    out.append(cand)
-                if len(out) >= CHANNEL_LIMIT * 2:
-                    return out
+                    cands.append(cand)
+                    total += 1
+                    if is_import:
+                        imported += 1
+                if total >= CHANNEL_LIMIT * 2:
+                    break
+            per_seed.append(cands)
+            if total >= CHANNEL_LIMIT * 2:
+                break
+        out: List[_Candidate] = []
+        for cands in per_seed:
+            out.extend(cands[:GRAPH_PER_SEED])
+        for cands in per_seed:
+            out.extend(cands[GRAPH_PER_SEED:])
         return out
 
     def _candidate_for_node(self, node: str, reason: str, allowed: Set[str]) -> Optional[_Candidate]:
@@ -1244,6 +1888,11 @@ class SearchEngine:
                 hit = None
             if hit is None:
                 continue
+            if hit.repo_id and "repo_name" not in hit.extra:
+                # comme les morceaux : l'en-tête d'un passage du chat montre « dépôt/chemin », pas l'identifiant du dépôt
+                repo = loader.repos().get(hit.repo_id)
+                if repo is not None:
+                    hit.extra["repo_name"] = repo.name
             hit.score = round(float(f.score), 6)
             hit.channels = list(f.channels)
             hit.reason = " ; ".join(f.reasons[c] for c in _CHANNEL_PRIORITY if c in f.reasons)
@@ -1285,6 +1934,8 @@ class SearchEngine:
         hit = SearchHit(chunk_id=c.id, source_type=c.source_type or "file", source_id=c.source_id,
                         line_start=c.line_start, line_end=c.line_end, page=_as_int(meta.get("page")),
                         snippet=make_snippet(body), text=text, extra={"ordinal": c.ordinal})
+        if c.sha1:
+            hit.extra["sha1"] = str(c.sha1)  # empreinte du texte : même passage indexé sous deux sources
         if c.source_type == "file":
             f = loader.file(_as_int(c.source_id))
             if f is not None:
@@ -1365,7 +2016,12 @@ class SearchEngine:
                         text=text if text is not None else fallback,
                         extra={"endpoint_id": e.id, "side": e.side, "method": (e.method or "").upper(), "route": e.path,
                                "normalized_path": e.normalized_path, "handler": e.handler or "",
-                               "framework": e.framework or ""})
+                               "framework": e.framework or "", "request_class": "", "request_class_id": None})
+        req = loader.request_class(e.handler) if e.side == "server" else None
+        if req is not None:
+            hit.extra["request_class_id"], hit.extra["request_class"] = req[0], req[1]
+            if req[2] is not None:
+                hit.extra["request_file_id"] = req[2]
         return hit
 
     def _hit_from_model(self, m: Optional[ModelRow], loader: _Loader) -> Optional[SearchHit]:
@@ -1420,14 +2076,25 @@ class SearchEngine:
         """Déduplication puis diversité.
 
         Deux résultats du même fichier dont les lignes se chevauchent décrivent le même code : on n'en
-        garde qu'un. Un élément exact (symbole, endpoint, modèle trouvé par ``identifier``) l'emporte
-        sur un simple morceau ; sinon le mieux classé gagne. Le gagnant cumule les preuves (score,
-        canaux, raison). Deux éléments structurés distincts (classe et méthode…) sont tous deux
-        conservés. Enfin, au plus :data:`MAX_PER_SOURCE` résultats par fichier / document / note.
+        garde qu'un. Un élément structuré (symbole, endpoint, modèle — trouvé par ``identifier``,
+        ``route`` ou ``graph``) l'emporte sur un simple morceau, car il porte sa signature, son
+        gestionnaire ou ses champs ; entre deux morceaux, le mieux classé gagne. Le gagnant cumule les
+        preuves (score, canaux, raison). Deux éléments structurés distincts (classe et méthode…) sont
+        tous deux conservés. Un même texte indexé sous deux sources (le PDF d'un dépôt et le même PDF
+        téléversé comme document : même ``chunks.sha1``) n'est gardé qu'une fois, sous sa source la mieux
+        classée, qui cumule les preuves de l'autre. Enfin, au plus :data:`MAX_PER_SOURCE` résultats par
+        fichier / document / note.
         """
         kept: List[SearchHit] = []
         by_file: Dict[int, List[SearchHit]] = {}
+        by_sha: Dict[str, SearchHit] = {}  # empreinte du texte -> morceau conservé (toutes sources confondues)
         for hit in hits:
+            sha = SearchEngine._content_key(hit)
+            if sha is not None:
+                twin = by_sha.get(sha)
+                if twin is not None:
+                    SearchEngine._merge_evidence(twin, hit)
+                    continue
             fid = hit.file_id if hit.source_type in ("file", "symbol", "endpoint", "model") else None
             if fid is not None and hit.line_start is not None and hit.line_end is not None:
                 duplicate = None
@@ -1446,10 +2113,15 @@ class SearchEngine:
                         kept[kept.index(duplicate)] = winner
                         bucket = by_file[fid]
                         bucket[bucket.index(duplicate)] = winner
+                        for key, value in by_sha.items():
+                            if value is duplicate:
+                                by_sha[key] = winner  # les jumeaux suivants cumulent sur le gagnant
                     continue
             kept.append(hit)
             if fid is not None:
                 by_file.setdefault(fid, []).append(hit)
+            if sha is not None:
+                by_sha[sha] = hit
         kept.sort(key=lambda h: -h.score)
         out: List[SearchHit] = []
         per_source: Dict[Tuple[str, int], int] = {}
@@ -1464,13 +2136,58 @@ class SearchEngine:
         return out
 
     @staticmethod
-    def _is_exact_element(hit: SearchHit) -> bool:
-        return hit.source_type in ("symbol", "endpoint", "model") and "identifier" in hit.channels
+    def _targets(client: SearchHit, server: SearchHit) -> bool:
+        """Vrai si l'appel client vise cette route serveur : même chemin normalisé, ou chemin de l'appel égal à
+        la fin du chemin serveur (``/orders/:param/confirm`` vise ``/api/orders/:param/confirm``), et méthode
+        compatible (égale, ou ``ANY`` d'un côté)."""
+        cp = str(client.extra.get("normalized_path") or "")
+        sp = str(server.extra.get("normalized_path") or "")
+        if len(cp) <= 1 or not (sp == cp or sp.endswith(cp)):
+            return False
+        cm = str(client.extra.get("method") or "ANY").upper()
+        sm = str(server.extra.get("method") or "ANY").upper()
+        return cm == sm or "ANY" in (cm, sm)
+
+    @staticmethod
+    def _server_routes_first(hits: List[SearchHit]) -> List[SearchHit]:
+        """Un appel client (``fetch()`` d'une vue Blade, ``Http::post`` d'un service) est un usage d'une route, pas
+        la route. La route serveur qu'il vise est une graine du graphe, qui ne crédite que ses voisins : l'appel
+        cumule alors le crédit du canal route, du graphe (voisin « appel d'API ») et du morceau de sa vue, et
+        passe devant la route elle-même. S'il précède une route serveur qu'il vise (:meth:`_targets`), il est
+        replacé juste derrière elle, à son score, et porte ``after_server_route`` (identifiant de la route).
+        Un appel vers un service tiers, sans route serveur dans les résultats, ne bouge pas."""
+        out = list(hits)
+        for client in hits:
+            if client.source_type != "endpoint" or client.extra.get("side") != "client":
+                continue
+            i = next(k for k, h in enumerate(out) if h is client)
+            twin = next((h for h in out[i + 1:] if h.source_type == "endpoint" and h.extra.get("side") == "server"
+                         and SearchEngine._targets(client, h)), None)
+            if twin is None:
+                continue
+            del out[i]
+            j = next(k for k, h in enumerate(out) if h is twin)
+            out.insert(j + 1, client)
+            client.score = twin.score
+            client.extra["after_server_route"] = twin.extra.get("endpoint_id")
+        return out
+
+    @staticmethod
+    def _is_structured(hit: SearchHit) -> bool:
+        return hit.source_type in ("symbol", "endpoint", "model")
+
+    @staticmethod
+    def _content_key(hit: SearchHit) -> Optional[str]:
+        """Empreinte ``chunks.sha1`` d'un morceau (``None`` pour un élément structuré ou un hit sans morceau)."""
+        if hit.chunk_id is None:
+            return None
+        sha = hit.extra.get("sha1") if isinstance(hit.extra, dict) else None
+        return str(sha) if sha else None
 
     @staticmethod
     def _pick_winner(first: SearchHit, second: SearchHit) -> Tuple[SearchHit, SearchHit]:
-        """``first`` est le mieux classé ; un élément exact l'emporte toutefois sur un morceau."""
-        if SearchEngine._is_exact_element(second) and not SearchEngine._is_exact_element(first):
+        """``first`` est le mieux classé ; un élément structuré l'emporte toutefois sur un morceau."""
+        if SearchEngine._is_structured(second) and not SearchEngine._is_structured(first):
             return second, first
         return first, second
 
@@ -1516,5 +2233,7 @@ def _short_error(exc: BaseException) -> str:
     return msg if len(msg) <= 160 else msg[:159] + "…"
 
 
-__all__ = ["CHANNELS", "HIT_SOURCE_TYPES", "MAX_PER_SOURCE", "RRF_K", "SearchEngine", "SearchHit", "SearchResult",
-           "edit_distance", "fuzzy_key", "lexical_terms_found", "make_snippet", "max_edits", "read_file_lines"]
+__all__ = ["CHANNELS", "CLASS_KINDS", "GENERATED_FILE_MAX_BYTES", "HIT_SOURCE_TYPES", "MAX_PER_SOURCE", "ROUTE_LIMIT",
+           "RRF_K", "SearchEngine", "SearchHit", "SearchResult", "edit_distance", "fuzzy_key", "handler_words",
+           "inherited_words", "is_dynamic_client_call", "is_generated_file", "lexical_terms_found", "make_snippet", "max_edits",
+           "question_language", "read_file_lines", "request_class_names", "route_contains", "word_names_symbol"]

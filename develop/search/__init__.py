@@ -9,18 +9,24 @@ from develop.search.engine import (  # noqa: F401
     make_snippet,
 )
 from develop.search.query import (  # noqa: F401
+    EXPANSIONS,
+    FOLLOWUP_MARKER,
     INTENTS,
     QueryAnalysis,
     analyze_query,
     detect_intent,
+    expand_terms,
     extract_dates,
     extract_identifiers,
     extract_keywords,
     extract_tables,
+    split_followup,
 )
 
 __all__ = [
     "CHANNELS",
+    "EXPANSIONS",
+    "FOLLOWUP_MARKER",
     "HIT_SOURCE_TYPES",
     "INTENTS",
     "QueryAnalysis",
@@ -29,9 +35,11 @@ __all__ = [
     "SearchResult",
     "analyze_query",
     "detect_intent",
+    "expand_terms",
     "extract_dates",
     "extract_identifiers",
     "extract_keywords",
     "extract_tables",
     "make_snippet",
+    "split_followup",
 ]

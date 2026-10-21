@@ -122,6 +122,40 @@ def test_is_probably_binary(tmp_path: Path, sample_project: Path):
     assert not is_probably_binary(str(tmp_path / "absent.txt"))
 
 
+def test_default_exclusions_user_content_dirs(tmp_path: Path):
+    """Reproduction : 431 des 1 503 fichiers d'un dépôt Laravel étaient des attestations générées (PDF / DOCX avec
+    noms et numéros de pièces réels) sous ``docker/migration/media/``. Les dossiers de contenus déposés ou produits
+    par l'application (``media``, ``uploads``, ``attachments``, ``backups``, ``dumps``…) sont exclus par défaut,
+    comme ``vendor/`` ; un dossier de documentation sous ``public/`` reste parcouru."""
+    (tmp_path / "app" / "Models").mkdir(parents=True)
+    (tmp_path / "app" / "Models" / "User.php").write_text("<?php\nclass User {}\n", encoding="utf-8")
+    (tmp_path / "public" / "documentation").mkdir(parents=True)
+    (tmp_path / "public" / "documentation" / "guide.pdf").write_bytes(b"%PDF-1.4\n%guide\n")
+    for rel, data in (("docker/migration/media/media/4/attestation.pdf", b"%PDF-1.4\n%nom prenom piece\n"),
+                      ("uploads/cv-candidat.docx", b"PK\x03\x04docx"),
+                      ("public/attachments/note.md", b"# piece jointe\n"),
+                      ("backups/prod-2026.sql", b"insert into users values (1, 'nom');\n"),
+                      ("dumps/users.csv", b"id,nom\n1,x\n")):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    for name in ("media", "uploads", "upload", "attachments", "backups", "dumps"):
+        assert name in DEFAULT_EXCLUDED_DIRS
+    assert is_excluded_dir_path("docker/migration/media/media/4") and is_excluded_dir_path("public/uploads")
+    assert not is_excluded_dir_path("app/Media") and not is_excluded_dir_path("public/documentation")
+
+    res = scan_repo(str(tmp_path), "r", use_git=False)
+    assert _paths(res) == ["app/Models/User.php", "public/documentation/guide.pdf"]
+    assert res.skipped["excluded_dir"] == 5  # media, uploads, public/attachments, backups, dumps (dossiers élagués)
+    if git_available():
+        _git(tmp_path, "init", "-q", "-b", "main")
+        _git(tmp_path, "add", "-A")
+        _git(tmp_path, "commit", "-q", "-m", "init")
+        res = scan_repo(str(tmp_path), "r", use_git=True)
+        assert res.used_git and _paths(res) == ["app/Models/User.php", "public/documentation/guide.pdf"]
+        assert res.skipped["excluded_dir"] == 5  # en mode git : fichiers listés sous un dossier exclu
+
+
 def test_default_exclusions_content():
     for d in ("node_modules", "vendor", ".git", "dist", "__pycache__", "storage/framework", ".terraform"):
         assert d in DEFAULT_EXCLUDED_DIRS

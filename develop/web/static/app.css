@@ -332,6 +332,11 @@ a.cite:hover { text-decoration: none; filter: brightness(.95); }
 .msg-role { font-size: 12px; color: var(--fg-muted); margin-bottom: 4px; }
 .msg-status { font-size: 12.5px; color: var(--fg-muted); display: flex; align-items: center; gap: 8px; margin: 4px 0; }
 .msg-foot { font-size: 12px; color: var(--fg-muted); margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; }
+.msg-foot .budget-truncated { color: var(--warn); }
+/* Bandeau « Recherche lexicale seule » : aligné sur les messages (860 px), au-dessus du fil. */
+.chat-main > .chat-banner { flex: none; margin: 14px auto 0; width: min(860px, calc(100% - 48px)); align-items: flex-start; }
+.chat-banner .alert-body { line-height: 1.7; }
+.chat-banner .md-code { white-space: nowrap; }
 .sources { margin: 8px 0; }
 .sources-list { display: flex; flex-direction: column; gap: 4px; }
 .source { display: flex; gap: 8px; align-items: baseline; padding: 4px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }

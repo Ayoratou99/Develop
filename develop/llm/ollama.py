@@ -11,6 +11,10 @@ from develop.llm.base import (ChatChunk, ChatMessage, EngineStatus, LLMClient, L
                               ModelInfo, ModelNotFound, ToolCall, ToolSpec, context_length_from_model_info)
 
 
+KEEP_ALIVE = "30m"  # garde les modèles en mémoire entre deux questions (Ollama décharge après 5 min par défaut)
+EMBED_NUM_CTX = 4096  # fenêtre suffisante pour un morceau (≤ 8 000 caractères) : évite 4,8 Go de cache KV inutile
+
+
 def _msg_to_ollama(m: ChatMessage) -> Dict[str, Any]:
     d: Dict[str, Any] = {"role": m.role, "content": m.content}
     if m.tool_calls:
@@ -122,7 +126,7 @@ class OllamaClient(LLMClient):
         if max_tokens:
             options["num_predict"] = int(max_tokens)
         payload: Dict[str, Any] = {"model": model, "messages": [_msg_to_ollama(m) for m in messages],
-                                   "stream": True, "options": options}
+                                   "stream": True, "options": options, "keep_alive": KEEP_ALIVE}
         if tools:
             payload["tools"] = [t.to_openai() for t in tools]
         if think is not None:  # uniquement pour les modèles qui supportent la réflexion (Ollama refuse sinon)
@@ -163,12 +167,31 @@ class OllamaClient(LLMClient):
         except httpx.HTTPError as exc:
             raise LLMUnavailable("Ollama injoignable sur %s (%s)." % (self.base_url, exc.__class__.__name__)) from exc
 
+    async def loaded_models(self) -> List[str]:
+        """Modèles présents en mémoire (GET /api/ps) ; [] si l'information est indisponible."""
+        try:
+            data = await self._get_json("/api/ps", timeout=3.0)
+        except LLMError:
+            return []
+        return [str(m.get("name") or m.get("model") or "") for m in (data or {}).get("models", []) if m]
+
+    async def warm(self, model: str) -> bool:
+        """Charge le modèle en mémoire (POST /api/generate sans prompt) et le garde ``KEEP_ALIVE``."""
+        if not model:
+            return False
+        try:
+            await self._post_json("/api/generate", {"model": model, "keep_alive": KEEP_ALIVE}, timeout=300.0)
+        except LLMError:
+            return False
+        return True
+
     async def embed(self, texts: Sequence[str], model: str) -> List[List[float]]:
         if not texts:
             return []
         # API moderne (/api/embed, entrée multiple) puis repli sur l'ancienne (/api/embeddings, une par une).
         try:
-            data = await self._post_json("/api/embed", {"model": model, "input": list(texts)}, timeout=300.0)
+            data = await self._post_json("/api/embed", {"model": model, "input": list(texts), "keep_alive": KEEP_ALIVE,
+                                                        "options": {"num_ctx": EMBED_NUM_CTX}}, timeout=300.0)
             vectors = data.get("embeddings")
             if isinstance(vectors, list) and len(vectors) == len(texts):
                 return [[float(x) for x in v] for v in vectors]
@@ -178,7 +201,8 @@ class OllamaClient(LLMClient):
             pass
         out: List[List[float]] = []
         for t in texts:
-            data = await self._post_json("/api/embeddings", {"model": model, "prompt": t}, timeout=300.0)
+            data = await self._post_json("/api/embeddings", {"model": model, "prompt": t, "keep_alive": KEEP_ALIVE,
+                                                             "options": {"num_ctx": EMBED_NUM_CTX}}, timeout=300.0)
             vec = data.get("embedding")
             if not isinstance(vec, list):
                 raise LLMError("Réponse d'embedding invalide d'Ollama pour le modèle %s" % model)

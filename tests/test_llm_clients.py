@@ -190,3 +190,31 @@ def test_parse_text_tool_calls():
 def test_context_length_helper():
     assert base.context_length_from_model_info({"llama.context_length": 131072, "x": 1}) == 131072
     assert base.context_length_from_model_info({}) is None
+
+
+async def test_ollama_keeps_models_warm_and_bounds_embedding_context():
+    """keep_alive sur chat et embeddings, num_ctx réduit pour l'embedder, /api/ps et préchauffage."""
+    seen = {}
+
+    def handler(request):
+        p = request.url.path
+        body = json.loads(request.content) if request.content else {}
+        seen[p] = body
+        if p == "/api/chat":
+            return httpx.Response(200, content=json.dumps({"message": {"role": "assistant", "content": "ok"}, "done": True}).encode())
+        if p == "/api/embed":
+            return httpx.Response(200, json={"embeddings": [[0.1, 0.2]]})
+        if p == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": "qwen3.8:27b", "size": 1}]})
+        if p == "/api/generate":
+            return httpx.Response(200, json={"done": True})
+        return fake_ollama(request)
+    c = OllamaClient(transport=httpx.MockTransport(handler))
+    async for _ in c.chat_stream([base.ChatMessage("user", "q")], "qwen3.8:27b", num_ctx=8192):
+        pass
+    assert seen["/api/chat"]["keep_alive"] == "30m"
+    await c.embed(["x"], "qwen3-embedding:0.6b")
+    assert seen["/api/embed"]["keep_alive"] == "30m" and seen["/api/embed"]["options"]["num_ctx"] == 4096
+    assert await c.loaded_models() == ["qwen3.8:27b"]
+    assert await c.warm("qwen3.8:27b") is True and seen["/api/generate"] == {"model": "qwen3.8:27b", "keep_alive": "30m"}
+    assert await base.NullClient().loaded_models() == [] and await base.NullClient().warm("x") is False

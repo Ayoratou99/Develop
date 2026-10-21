@@ -21,7 +21,7 @@ import zipfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Extension (sans point, minuscule) -> format logique. ``log`` est volontairement exclu.
 SUPPORTED_FORMATS: Dict[str, str] = {
@@ -252,6 +252,79 @@ def _markdown_title(text: str) -> Optional[str]:
 
 # --------------------------------------------------------------------------- PDF
 
+FURNITURE_MIN_PAGES = 3  # en deçà, rien n'est retiré : deux pages ne font pas une répétition
+FURNITURE_ZONE_LINES = 3  # lignes non vides examinées en tête et en pied de chaque page
+FURNITURE_MAX_CHARS = 120  # au-delà, une ligne de tête ou de pied est du contenu, pas un en-tête courant
+_PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?[-–—]?\s*\d{1,4}\s*(?:(?:/|sur|of|de)\s*\d{1,4})?\s*[-–—]?\s*$",
+                             re.IGNORECASE)
+
+
+def strip_page_furniture(pages: Sequence[str], min_pages: int = FURNITURE_MIN_PAGES) -> Tuple[List[str], List[str]]:
+    """Retire l'en-tête et le pied de page courants d'un document paginé (PDF).
+
+    Une ligne qui revient à l'identique en tête (ou en pied) d'au moins la moitié des pages, et de
+    ``min_pages`` au moins, est un en-tête courant (titre du document, nom du chapitre) ; un numéro de
+    page seul (« 4 », « page 4 », « 4 / 19 ») en tête ou en pied est retiré dès que la moitié des pages
+    en portent un à cet endroit. Seules les :data:`FURNITURE_ZONE_LINES` premières et dernières lignes non
+    vides de chaque page sont concernées, jamais le milieu d'une page. Sans cela, l'en-tête courant est
+    présent dans la plupart des morceaux d'un document et chaque morceau « contient » le titre du document :
+    la recherche lexicale ne les distingue plus et le sommaire l'emporte sur la section demandée.
+
+    Renvoie ``(pages nettoyées, lignes retirées distinctes)``.
+    """
+    texts = [str(p or "") for p in pages]
+    n = len(texts)
+    if n < max(2, int(min_pages)):
+        return texts, []
+    split = [t.splitlines() for t in texts]
+
+    def zones(lines: List[str]) -> Dict[str, List[int]]:
+        idx = [i for i, line in enumerate(lines) if line.strip()]
+        head = idx[:FURNITURE_ZONE_LINES]
+        tail = [i for i in idx[-FURNITURE_ZONE_LINES:] if i not in head]
+        return {"head": head, "tail": tail}
+
+    page_zones = [zones(lines) for lines in split]
+    counts: Dict[Tuple[str, str], int] = {}
+    numbered: Dict[str, int] = {"head": 0, "tail": 0}
+    for lines, z in zip(split, page_zones):
+        for pos, idxs in z.items():
+            seen: set = set()
+            has_number = False
+            for i in idxs:
+                key = " ".join(lines[i].split())
+                if _PAGE_NUMBER_RE.match(key):
+                    has_number = True
+                    continue
+                if len(key) > FURNITURE_MAX_CHARS or key in seen:
+                    continue
+                seen.add(key)
+                counts[(pos, key)] = counts.get((pos, key), 0) + 1
+            if has_number:
+                numbered[pos] += 1
+    threshold = max(int(min_pages), (n + 1) // 2)
+    furniture = {k for k, c in counts.items() if c >= threshold}
+    number_zones = {pos for pos, c in numbered.items() if c >= threshold}
+    if not furniture and not number_zones:
+        return texts, []
+    removed: List[str] = []
+    out: List[str] = []
+    for text, lines, z in zip(texts, split, page_zones):
+        drop: set = set()
+        for pos, idxs in z.items():
+            # retiré depuis le bord de la page seulement : la première ligne de contenu arrête le retrait
+            for i in (idxs if pos == "head" else reversed(idxs)):
+                key = " ".join(lines[i].split())
+                if not ((pos, key) in furniture or (pos in number_zones and _PAGE_NUMBER_RE.match(key))):
+                    break
+                drop.add(i)
+                if key not in removed:
+                    removed.append(key)
+        kept = [line for i, line in enumerate(lines) if i not in drop]
+        out.append("\n".join(kept) + ("\n" if text.endswith("\n") and kept else ""))
+    return out, removed
+
+
 def page_for_offset(page_offsets: List[int], offset: int) -> int:
     """Numéro de page (1-based) contenant la position ``offset`` dans le texte d'un PDF."""
     if not page_offsets:
@@ -286,20 +359,27 @@ def _load_pdf(data: bytes, doc: LoadedDocument) -> None:
         doc.warnings.append("PDF illisible ou corrompu : %s" % exc)
         return
 
-    # Chaque page se termine par "\n" avant le séparateur "\f" : ``splitlines()`` produit ainsi une
-    # ligne vide entre deux pages, ce qui en fait une frontière de paragraphe pour le découpage.
-    parts: List[str] = []
-    offsets: List[int] = []
+    raw_pages: List[str] = []
     empty_pages = 0
-    pos = 0
     for i in range(n_pages):
         try:
             page_text = reader.pages[i].extract_text() or ""
         except Exception:  # noqa: BLE001
             page_text = ""
-        page_text = page_text.strip("\n") + "\n"
         if not page_text.strip():
-            empty_pages += 1
+            empty_pages += 1  # compté avant nettoyage : une page qui ne porte que l'en-tête courant n'est pas un scan
+        raw_pages.append(page_text)
+    # En-tête / pied de page courants et numéros de page retirés (voir :func:`strip_page_furniture`).
+    pages, running = strip_page_furniture(raw_pages)
+    if running:
+        doc.meta["running_lines"] = running
+    # Chaque page se termine par "\n" avant le séparateur "\f" : ``splitlines()`` produit ainsi une
+    # ligne vide entre deux pages, ce qui en fait une frontière de paragraphe pour le découpage.
+    parts: List[str] = []
+    offsets: List[int] = []
+    pos = 0
+    for page_text in pages:
+        page_text = page_text.strip("\n") + "\n"
         offsets.append(pos)
         parts.append(page_text)
         pos += len(page_text) + len(PAGE_SEPARATOR)

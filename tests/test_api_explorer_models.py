@@ -140,6 +140,22 @@ def test_model_detail_lists_documents_of_the_whole_entity(env: SimpleNamespace):
         assert note_node not in items, (kind, items)
 
 
+def test_model_detail_lists_only_the_routes_of_the_entity(env: SimpleNamespace):
+    """Non-régression : « Endpoints qui l'utilisent » suit les relations ``endpoint:`` → modèle (contrôleur nommé
+    d'après le modèle ou l'important), jamais toutes les routes du fichier ``routes/api.php``."""
+    c = env.client
+    by_kind = _models_named(c, "Order", "orders")
+    d = c.get("/api/models/%d" % by_kind["eloquent"]["id"]).json()
+    routes = sorted((e["method"], e["path"]) for e in d["endpoints_using"])
+    assert routes == [("GET", "/orders"), ("GET", "/orders/{order}"), ("POST", "/orders/{order}/confirm")], routes
+    assert all(e["side"] == "server" and e["file"].endswith("routes/api.php") for e in d["endpoints_using"])
+    assert len({e["id"] for e in d["endpoints_using"]}) == len(d["endpoints_using"])
+    customer = _models_named(c, "Customer", "customers")["eloquent"]
+    d = c.get("/api/models/%d" % customer["id"]).json()
+    paths = {e["path"] for e in d["endpoints_using"]}
+    assert paths and all("customers" in p for p in paths), paths
+
+
 def test_documents_mentioning_prefers_direct_relation_and_bounds_confidence():
     """Règles du détour : relation directe > détour ; confiance = min(relation, chemin) ; un fichier n'a pas de détour."""
     with Database(":memory:") as db:

@@ -4,7 +4,9 @@ Quatre modes, choisis par :func:`chunk_for_file` ou passés à :func:`chunk_text
 
 * ``code`` : frontières de définitions (fonctions, classes, routes…) puis lignes vides ;
 * ``markdown`` : sections par titres (``#``…``######``) puis paragraphes, tableaux jamais coupés ;
-* ``prose`` : paragraphes regroupés avec chevauchement de phrases ;
+* ``prose`` : paragraphes regroupés avec chevauchement de phrases, sections par titres numérotés
+  (« 4. Les champs ») portées par ``meta["heading_path"]`` / ``meta["section"]``, jamais à cheval
+  sur un saut de page (caractère *form feed*, séparateur des pages d'un PDF) ;
 * ``data`` : fenêtres de lignes avec chevauchement et rappel de l'en-tête.
 
 Invariants : aucun morceau vide, ordinaux séquentiels, ``line_start``/``line_end`` 1-based
@@ -14,7 +16,7 @@ plus longue (et tableaux Markdown de moins de ``2 * max_chars``).
 from __future__ import annotations
 
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -536,18 +538,169 @@ def _markdown_pieces(lines: List[str], max_chars: int, overlap_chars: int, langu
 
 # --------------------------------------------------------------------------- mode prose
 
-def _prose_pieces(lines: List[str], max_chars: int, overlap_chars: int, language: Optional[str]) -> List[_Piece]:
+_NUMBERED_HEADING_RE = re.compile(r"^ {0,3}(\d{1,2}(?:\.\d{1,2}){0,3})\.?[ \t]+(\S.*?)[ \t]*$")
+HEADING_MAX_CHARS = 100  # au-delà, une ligne numérotée est un paragraphe, pas un titre
+HEADING_MAX_WORDS = 14
+_MONTH_WORDS = frozenset(
+    "janvier fevrier février mars avril mai juin juillet aout août septembre octobre novembre decembre décembre "
+    "janv fevr févr sept oct nov dec déc january february march april may june july august september october "
+    "november december jan feb apr jun jul aug".split())
+
+
+def numbered_heading(line: str) -> Optional[Tuple[int, str]]:
+    """``(niveau, titre)`` si ``line`` ressemble à un titre de section numéroté d'un document en prose
+    (« 4. Les champs (custom et partagés) » → ``(1, "4. Les champs (custom et partagés)")``, « 2.1 Modèle »
+    → niveau 2), sinon ``None``. Un titre est court, commence par une lettre et ne se termine pas comme une
+    phrase : « 1. Créer le template puis le téléverser. » est une étape de liste."""
+    s = line.strip("\r\n")
+    if not s.strip() or len(s.strip()) > HEADING_MAX_CHARS:
+        return None
+    m = _NUMBERED_HEADING_RE.match(s)
+    if m is None:
+        return None
+    number, title = m.group(1), m.group(2)
+    if not (title[0].isalpha() or title[0] in "(«\"'"):
+        return None
+    if title[-1] in ".:;,!?" or len(title.split()) > HEADING_MAX_WORDS:
+        return None
+    if title.split()[0].lower().rstrip(".") in _MONTH_WORDS:
+        return None  # « 27 juillet 2025 » est une date, pas un titre
+    return number.count(".") + 1, s.strip()
+
+
+def _prose_headings(lines: List[str]) -> List[Tuple[int, int, str]]:
+    """``[(index, niveau, titre)]`` des titres numérotés d'un texte en prose (PDF, texte brut, DOCX).
+
+    Une ligne numérotée est un titre quand la ligne non vide qui la suit est du texte (son corps) ou un
+    sous-titre plus profond lui-même titré (« 4. Les champs » puis « 4.1 Attributs »). Les entrées d'un
+    sommaire se suivent (même niveau) : aucune n'est un titre ; la dernière ligne d'une liste d'étapes
+    collée (« 1. Créer… » / « 2. Vérifier… » sur des lignes adjacentes) n'en est pas un non plus, même
+    suivie de texte."""
+    candidates: List[Tuple[int, int, str]] = []
+    for i, line in enumerate(lines):
+        h = numbered_heading(line)
+        if h is not None:
+            candidates.append((i, h[0], h[1]))
+    if not candidates:
+        return []
+    is_candidate = {idx for idx, _, _ in candidates}
+    n = len(candidates)
+    heading = [False] * n
+    for k in range(n - 1, -1, -1):  # de droite à gauche : le statut du suivant est connu
+        idx, level, _ = candidates[k]
+        nxt = next((j for j in range(idx + 1, len(lines)) if lines[j].strip()), None)
+        if nxt is None:
+            continue
+        if nxt in is_candidate:
+            heading[k] = k + 1 < n and candidates[k + 1][0] == nxt and candidates[k + 1][1] > level and heading[k + 1]
+        else:
+            heading[k] = True
+    for k in range(1, n):  # dernière ligne d'une liste collée de même niveau : pas un titre
+        idx, level, _ = candidates[k]
+        prev_idx, prev_level, _ = candidates[k - 1]
+        if heading[k] and not heading[k - 1] and prev_level == level and prev_idx == idx - 1:
+            heading[k] = False
+    return [cand for cand, ok in zip(candidates, heading) if ok]
+
+
+PAGE_BREAK = "\f"  # fin de page d'un texte paginé (``loaders.PAGE_SEPARATOR``) : une page = un bloc de lignes
+
+
+def _page_starts(text: str) -> List[int]:
+    """Indices (0-based, croissants) des lignes qui ouvrent une nouvelle page : la ligne précédente, au sens
+    de ``splitlines()``, se termine par :data:`PAGE_BREAK`. Vide pour un texte non paginé."""
+    if PAGE_BREAK not in text:
+        return []
+    return [i + 1 for i, raw in enumerate(text.splitlines(keepends=True)) if raw.endswith(PAGE_BREAK)]
+
+
+def _split_at_pages(blocks: List[Tuple[int, int]], page_starts: List[int]) -> List[Tuple[int, int]]:
+    """Coupe les blocs ``[a, b)`` à chaque début de page qu'ils enjambent."""
+    if not page_starts:
+        return blocks
+    out: List[Tuple[int, int]] = []
+    for a, b in blocks:
+        for cut in page_starts[bisect_right(page_starts, a):bisect_left(page_starts, b)]:
+            out.append((a, cut))
+            a = cut
+        out.append((a, b))
+    return out
+
+
+def _prose_pieces(lines: List[str], max_chars: int, overlap_chars: int, language: Optional[str],
+                  page_starts: Optional[List[int]] = None) -> List[_Piece]:
+    """Paragraphes regroupés avec chevauchement de phrases ; les titres numérotés (:func:`numbered_heading`)
+    ouvrent des sections qui ne se mélangent jamais dans un morceau (comme les titres Markdown) et dont le
+    chemin est porté par ``meta["heading_path"]`` / ``meta["section"]`` : la section « 4. Les champs »
+    d'un PDF est un morceau qui commence par son titre, pas la fin de la section 3 suivie du début de la 4.
+
+    ``page_starts`` (:func:`_page_starts`) : aucun morceau ne chevauche un saut de page et le rappel des
+    dernières phrases ne traverse jamais une page, de sorte que le libellé « page N » d'un morceau (calculé
+    par l'indexeur sur sa première ligne) corresponde à son contenu. Seul un titre isolé en bas de page
+    rejoint son corps sur la page suivante."""
     meta: Dict[str, Any] = {"kind": "prose"}
     if language:
         meta["language"] = language
     budget = max(1, max_chars - overlap_chars) if overlap_chars < max_chars // 2 else max_chars
-    spans = [_Span(a, b, dict(meta), split="sentences") for a, b in _paragraph_blocks(lines, 0, len(lines))]
-    pieces = _pack(lines, spans, budget, overlap_chars)
+    n = len(lines)
+    starts = sorted(set(page_starts or []))
+
+    def page_of(i: int) -> int:
+        return bisect_right(starts, i)
+    headings = _prose_headings(lines)
+    sections: List[Tuple[int, int, List[str]]] = []
+    stack: List[Tuple[int, str]] = []
+    first_heading = headings[0][0] if headings else n
+    if first_heading > 0:
+        sections.append((0, first_heading, []))
+    for k, (idx, level, title) in enumerate(headings):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        end = headings[k + 1][0] if k + 1 < len(headings) else n
+        sections.append((idx, end, [t for _, t in stack]))
+    pieces: List[_Piece] = []
+    carry_start: Optional[int] = None  # titres sans corps reportés sur la section suivante
+    for si, (start, end, path) in enumerate(sections):
+        is_heading_section = start >= first_heading
+        body_start = start + 1 if is_heading_section else start
+        blocks = _split_at_pages(_paragraph_blocks(lines, body_start, end), starts)
+        if is_heading_section and not blocks and si + 1 < len(sections):
+            if carry_start is None:
+                carry_start = start
+            continue
+        real_start = carry_start if carry_start is not None else start
+        carry_start = None
+        sec_meta = dict(meta)
+        if path:
+            sec_meta["heading_path"] = list(path)
+            sec_meta["section"] = path[-1]
+        spans = [_Span(a, b, dict(sec_meta), split="sentences") for a, b in blocks]
+        if spans:
+            if is_heading_section:
+                spans[0].head = spans[0].a - real_start  # le titre reste collé au premier bloc
+                spans[0].a = real_start
+        elif is_heading_section:
+            spans = [_Span(real_start, start + 1, dict(sec_meta))]
+        # Empaquetage page par page : deux blocs de pages différentes ne sont jamais réunis.
+        group: List[_Span] = []
+        for sp in spans:
+            if group and page_of(sp.b - 1) != page_of(group[-1].b - 1):
+                pieces.extend(_pack(lines, group, budget, overlap_chars))
+                group = []
+            group.append(sp)
+        pieces.extend(_pack(lines, group, budget, overlap_chars))
     if overlap_chars <= 0 or len(pieces) < 2:
         return pieces
-    # Chevauchement : chaque morceau reprend les dernières phrases du précédent (si contiguës).
+    # Chevauchement : chaque morceau reprend les dernières phrases du précédent (si contiguës et de même section).
     out: List[_Piece] = [pieces[0]]
     for prev, cur in zip(pieces, pieces[1:]):
+        if cur.meta.get("heading_path") != prev.meta.get("heading_path"):
+            out.append(cur)  # nouvelle section : elle commence par son titre, pas par la fin de la précédente
+            continue
+        if page_of(cur.sl) != page_of(prev.el):
+            out.append(cur)  # nouvelle page : aucun rappel de la page précédente (libellé de page exact)
+            continue
         if cur.sl <= prev.el and not (cur.sl == prev.el and cur.sc >= prev.ec):
             out.append(cur)  # déjà en chevauchement (découpe par phrases)
             continue
@@ -656,7 +809,7 @@ def chunk_text(text: str, kind: str, *, max_chars: int = 1500, overlap_chars: in
     elif kind == "markdown":
         pieces = _markdown_pieces(lines, max_chars, overlap, language)
     elif kind == "prose":
-        pieces = _prose_pieces(lines, max_chars, overlap, language)
+        pieces = _prose_pieces(lines, max_chars, overlap, language, page_starts=_page_starts(text))
     else:
         pieces = _data_pieces(lines, max_chars, overlap, language)
     return _finalize(lines, pieces)

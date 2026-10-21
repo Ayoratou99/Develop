@@ -611,13 +611,30 @@ def get_model(model_id: int, request: Request) -> Dict[str, Any]:
                                     "file": None, "file_id": None, "repo_id": None, "line": None,
                                     "confidence": rel.confidence})
     data["linked"] = list(linked.values())
-    using_files = {int(r.src.split(":", 1)[1]) for r in db.relations_to(key, "uses_model")
+    # routes reliées directement (``endpoint:E`` → modèle, via leur contrôleur), puis routes serveur des fichiers
+    # qui utilisent le modèle (gestionnaires définis dans le fichier des routes) ; jamais deux fois la même
+    uses = db.relations_to(key, "uses_model")
+    using_endpoints = {int(r.src.split(":", 1)[1]) for r in uses
+                       if r.src.startswith("endpoint:") and r.src.split(":", 1)[1].isdigit()}
+    using_files = {int(r.src.split(":", 1)[1]) for r in uses
                    if r.src.startswith("file:") and r.src.split(":", 1)[1].isdigit()}
     endpoints_using: List[Dict[str, Any]] = []
+    seen_endpoints: Set[int] = set()
+    if using_endpoints:
+        ph = ",".join("?" * len(using_endpoints))
+        rows = db.query("SELECT * FROM endpoints WHERE id IN (%s) AND side = 'server' ORDER BY file_id, line, id" % ph,
+                        sorted(using_endpoints))
+        files = _files_by_ids(db, {r["file_id"] for r in rows})
+        for r in rows:
+            seen_endpoints.add(int(r["id"]))
+            endpoints_using.append(_endpoint_item(EndpointRow.from_row(r), files.get(r["file_id"])))
     if using_files:
         files = _files_by_ids(db, using_files)
         for fid in sorted(using_files):
             for r in db.query("SELECT * FROM endpoints WHERE file_id = ? AND side = 'server' ORDER BY line, id", (fid,)):
+                if int(r["id"]) in seen_endpoints:
+                    continue
+                seen_endpoints.add(int(r["id"]))
                 endpoints_using.append(_endpoint_item(EndpointRow.from_row(r), files.get(fid)))
     data["endpoints_using"] = endpoints_using
     data["documents_mentioning"] = _documents_mentioning(db, key)

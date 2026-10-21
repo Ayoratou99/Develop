@@ -103,12 +103,17 @@ BINARY_EXTENSIONS: FrozenSet[str] = frozenset({
 
 #: Dossiers jamais parcourus. Un nom simple s'applique à tout dossier portant ce nom, à
 #: n'importe quelle profondeur ; un chemin (``storage/framework``) s'applique à cette
-#: séquence de segments, où qu'elle apparaisse.
+#: séquence de segments, où qu'elle apparaisse. Outre les dépendances et les artefacts de
+#: construction, les dossiers de *contenus* déposés ou produits par l'application (fichiers
+#: d'utilisateurs, pièces jointes, exports, sauvegardes : ``media/``, ``uploads/``…) sont
+#: écartés : ils ne contiennent jamais de code et souvent des données personnelles
+#: (attestations générées, pièces d'identité, dumps) qui n'ont rien à faire dans la mémoire.
 DEFAULT_EXCLUDED_DIRS: FrozenSet[str] = frozenset({
     "node_modules", "vendor", ".git", ".hg", ".svn", "dist", "build", "out", ".next", ".nuxt",
     ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache", "target", "coverage",
     ".idea", ".vscode", ".gradle", "Pods", "DerivedData", "bower_components", ".cache",
     "storage/framework", "storage/logs", "public/build", ".dart_tool", ".terraform",
+    "media", "uploads", "upload", "attachments", "backups", "dumps",
 })
 
 #: Motifs (sur le nom de fichier) des fichiers de secrets : clés privées, certificats, identifiants.

@@ -27,6 +27,8 @@ from develop.indexing import Indexer
 from develop.knowledge_graph import (
     DERIVED_KINDS,
     LinkStats,
+    MAX_HOMONYMS,
+    MIN_WEAK_MENTIONS,
     NameIndex,
     describe_relation,
     document_mentions,
@@ -417,6 +419,17 @@ def _undirected(rels: Dict[Tuple[str, str], RelationRow], a: str, b: str) -> Opt
     return rels.get((a, b)) or rels.get((b, a))
 
 
+def _source_file_id(db: Database, src: str) -> int:
+    """Fichier d'une source de relation ``uses_model`` : le fichier lui-même ou celui de la route."""
+    prefix, ident = src.split(":", 1)
+    if prefix == "file":
+        return int(ident)
+    assert prefix == "endpoint", src
+    ep = db.get_endpoint(int(ident))
+    assert ep is not None and ep.file_id is not None, src
+    return int(ep.file_id)
+
+
 # --------------------------------------------------------------------------- fixtures
 
 @pytest.fixture
@@ -695,8 +708,17 @@ def test_link_models_same_entity_and_uses_model(graph: Graph):
     assert uses[(f("frontend", "src/components/OrderList.tsx"), m("ts_interface", "Order"))].confidence == 0.6
     assert (f("frontend", "src/components/OrderList.tsx"), m("ts_interface", "Customer")) not in uses
     assert (f("backend", "app/Services/OrderService.php"), m("eloquent", "Order")) in uses
-    # gestionnaire d'endpoint citant le nom du modèle (OrderController@confirm → Order)
-    assert (f("backend", "routes/api.php"), m("eloquent", "Order")) in uses
+    # route gérée par le contrôleur nommé d'après le modèle (OrderController@confirm → Order) : la relation porte
+    # sur la route, jamais sur le fichier de routes qui déclare aussi /customers et /status
+    e = graph.ekey
+    for path in ("/orders", "/orders/{order}", "/orders/{order}/confirm"):
+        rel = uses[(e("server", "GET" if path != "/orders/{order}/confirm" else "POST", path), m("eloquent", "Order"))]
+        assert rel.confidence == 0.6 and rel.meta["rule"] == "handler" and rel.meta["via"] == "name"
+        assert rel.meta["handler"].startswith("OrderController@")
+    assert (e("server", "GET", "/customers"), m("eloquent", "Customer")) in uses
+    assert (e("server", "GET", "/customers"), m("eloquent", "Order")) not in uses
+    assert not any(src == e("server", "GET", "/status") for src, _dst in uses)
+    assert (f("backend", "routes/api.php"), m("eloquent", "Order")) not in uses
     # un fichier n'utilise pas le modèle qu'il définit
     assert (f("backend", "app/Models/Order.php"), m("eloquent", "Order")) not in uses
 
@@ -734,15 +756,18 @@ def test_link_models_name_rule_never_crosses_repositories(graph: Graph):
     # « OrderList » cite « Order » : seule l'interface TS du même dépôt est retenue
     assert (f("frontend", "src/components/OrderList.tsx"), m("ts_interface", "Order")) in uses
     assert (f("frontend", "src/components/OrderList.tsx"), m("eloquent", "Order")) not in uses
-    # règle « handler » : routes/api.php hérite des usages d'OrderController.php (backend), pas de la classe Java
-    assert uses[(f("backend", "routes/api.php"), m("eloquent", "Order"))].meta["rule"] == "handler"
-    assert (f("backend", "routes/api.php"), m("ts_interface", "Order")) not in uses
-    assert (f("backend", "routes/api.php"), m("jpa_entity", "Shipment")) not in uses
+    # règle « handler » : les routes du backend héritent des usages d'OrderController.php (backend), pas de la classe
+    # Java homonyme ; le fichier de routes lui-même n'est relié à rien
+    confirm = graph.ekey("server", "POST", "/orders/{order}/confirm")
+    assert uses[(confirm, m("eloquent", "Order"))].meta["rule"] == "handler"
+    assert (confirm, m("ts_interface", "Order")) not in uses
+    assert (confirm, m("jpa_entity", "Shipment")) not in uses
+    assert not any(src == f("backend", "routes/api.php") for src, _dst in uses)
     assert uses[(f("java", "src/main/java/com/acme/web/OrderController.java"), m("jpa_entity", "Shipment"))].meta["rule"] == "name"
     # invariant : aucune relation uses_model ne traverse les dépôts
     models_file = {int(row.id): int(row.file_id) for row in db.list_models() if row.id is not None}
     for src, dst in uses:
-        a = db.get_file_by_id(int(src[len("file:"):]))
+        a = db.get_file_by_id(_source_file_id(db, src))
         b = db.get_file_by_id(models_file[int(dst[len("model:"):])])
         assert a is not None and b is not None and a.repo_id == b.repo_id, (src, dst)
 
@@ -790,6 +815,178 @@ def test_link_models_monorepo_prefers_own_language_and_ignores_own_names(db: Dat
     assert (script, m_eloquent) in uses and (script, m_ts) in uses
 
 
+def _laravel_module(db: Database, root: Path) -> WorkspaceConfig:
+    """Dépôt « shop » (module Laravel) : modèles Shipment / Order / SharedWidget, contrôleurs et routes."""
+    root.mkdir(exist_ok=True)
+    db.upsert_repo(RepoRow(id="shop", name="shop", path=str(root), kind="backend"))
+    return WorkspaceConfig(id="ws", name="shop",
+                           repos=[RepoConfig(id="shop", name="shop", path=str(root), kind="backend")])
+
+
+def _add(db: Database, repo_id: str, path: str, language: str = "php", symbols: Sequence[SymbolRow] = (),
+         endpoints: Sequence[EndpointRow] = (), models: Sequence[ModelRow] = (),
+         imports: Sequence[Tuple[str, Sequence[str]]] = ()) -> int:
+    fid = db.upsert_file(FileRow(repo_id=repo_id, path=path, language=language, kind="code", size=10, mtime=1.0,
+                                 sha1="sha-" + path))
+    db.replace_file_artifacts(fid, symbols=list(symbols), endpoints=list(endpoints), models=list(models), chunks=[])
+    if imports:
+        db.add_relations([RelationRow(src=node_key("file", fid), dst=node_key("module", module), kind="imports_raw",
+                                      meta={"names": list(names), "line": 1, "is_relative": False})
+                          for module, names in imports])
+    return fid
+
+
+def test_link_models_name_rule_requires_the_exact_whole_word(db: Database, tmp_path: Path):
+    """Non-régression (règle « name ») : le nom du modèle doit apparaître tel quel, en mot entier.
+
+    Sur un index réel, ``Shipment`` était reconnu dans la méthode ``shipment()`` et ``FormTemplate`` dans la variable
+    ``$formTemplate`` d'une signature ``SurveyFormTemplate $formTemplate`` (correspondance insensible à la casse) : des DTO et des
+    policies « utilisaient » des modèles qu'ils ne citent jamais. Désormais ni ``shipments``, ni
+    ``ShipmentController``, ni ``$shipment`` ne valent ``Shipment`` ; la relation déclarée par un modèle
+    (``hasOne(Shipment::class)``, enregistrée par l'extracteur) relie en revanche son fichier à la cible.
+    """
+    ws = _laravel_module(db, tmp_path / "shop")
+    shipment = ModelRow(name="Shipment", kind="eloquent", table_name="shipments", line=9, fields=[{"name": "carrier"}],
+                        relations=[{"kind": "belongs_to", "target": "Order", "field": "order"}])
+    order = ModelRow(name="Order", kind="eloquent", table_name="orders", line=9,
+                          fields=[{"name": "ordered_at"}],
+                          relations=[{"kind": "has_one", "target": "Shipment", "field": "shipment"}])
+    form_template = ModelRow(name="FormTemplate", kind="eloquent", table_name="form_templates", line=7, fields=[{"name": "titre"}])
+    shipment_php = _add(db, "shop", "app/Models/Shipment.php", models=[shipment],
+                        symbols=[SymbolRow(name="Shipment", kind="class", line_start=9, line_end=30),
+                                 SymbolRow(name="order", kind="method", parent="Shipment", line_start=20,
+                                           line_end=23, signature="function order(): BelongsTo")])
+    order_php = _add(db, "shop", "app/Models/Order.php", models=[order],
+                          symbols=[SymbolRow(name="Order", kind="class", line_start=9, line_end=40),
+                                   SymbolRow(name="shipment", kind="method", parent="Order", line_start=30,
+                                             line_end=33, signature="function shipment(): HasOne")])
+    _add(db, "shop", "app/Models/FormTemplate.php", models=[form_template],
+         symbols=[SymbolRow(name="FormTemplate", kind="class", line_start=7, line_end=20)])
+    # variable homonyme en minuscules, pluriel, préfixe d'un autre identifiant : aucun usage
+    dto = _add(db, "shop", "app/DTOs/ReportVariables.php",
+               symbols=[SymbolRow(name="ReportVariables", kind="class", line_start=5, line_end=40),
+                        SymbolRow(name="fromFormTemplate", kind="method", parent="ReportVariables", line_start=10, line_end=20,
+                                  signature="function fromFormTemplate(SurveyFormTemplate $formTemplate, Survey $survey): self"),
+                        SymbolRow(name="shipments", kind="method", parent="ReportVariables", line_start=22, line_end=25,
+                                  signature="function shipments(): array"),
+                        SymbolRow(name="resolve", kind="method", parent="ReportVariables", line_start=26, line_end=30,
+                                  signature="function resolve(ShipmentController $shipment): string")])
+    # nom exact en mot entier dans une signature : usage
+    service = _add(db, "shop", "app/Services/DeliveryService.php",
+                   symbols=[SymbolRow(name="DeliveryService", kind="class", line_start=5, line_end=30),
+                            SymbolRow(name="deliver", kind="method", parent="DeliveryService", line_start=10, line_end=20,
+                                      signature="function deliver(Shipment $shipment): Shipment")])
+    resolve_imports(db, ws)
+    link_models(db, ws)
+    uses = _relations(db, "uses_model")
+    g, i, a = (node_key("model", int(m.id)) for m in (shipment, order, form_template))
+    assert not any(src == node_key("file", dto) for src, _dst in uses), [k for k in uses if k[0] == node_key("file", dto)]
+    assert uses[(node_key("file", service), g)].meta["rule"] == "name"
+    assert (node_key("file", service), i) not in uses and (node_key("file", service), a) not in uses
+    # relation déclarée par le modèle : Order.php utilise Shipment, Shipment.php utilise Order
+    assert uses[(node_key("file", order_php), g)].meta["rule"] == "relation"
+    assert uses[(node_key("file", shipment_php), i)].meta["rule"] == "relation"
+    assert (node_key("file", shipment_php), g) not in uses and (node_key("file", order_php), i) not in uses
+
+
+def test_link_models_handler_rule_links_routes_not_the_routes_file(db: Database, tmp_path: Path):
+    """Non-régression (règle « handler ») : une route serveur utilise le modèle de son contrôleur, pas le
+    fichier de routes.
+
+    Sur un index réel, ``routes/api.php`` (113 routes d'un module Laravel) « utilisait » ``Shipment`` parce
+    qu'une de ses routes était gérée par ``ShipmentController`` ; l'explorateur listait alors toutes les routes
+    du fichier (``shared-widgets``…) comme « endpoints qui utilisent Shipment ». Désormais la relation
+    porte sur chaque route (``endpoint:E``), vers le modèle dont le contrôleur porte le nom
+    (``<Modèle>Controller``, pluriel admis : ``UsersController`` → ``User``) ou que le fichier du contrôleur
+    importe ; une route gérée par un contrôleur sans rapport n'est reliée à rien.
+    """
+    ws = _laravel_module(db, tmp_path / "shop")
+    shipment = ModelRow(name="Shipment", kind="eloquent", table_name="shipments", line=9, fields=[{"name": "carrier"}])
+    order = ModelRow(name="Order", kind="eloquent", table_name="orders", line=9, fields=[{"name": "x"}])
+    widget = ModelRow(name="SharedWidget", kind="eloquent", table_name="shared_widgets", line=9,
+                         fields=[{"name": "label"}])
+    user = ModelRow(name="User", kind="eloquent", table_name="users", line=9, fields=[{"name": "email"}])
+    for name, model in (("Shipment", shipment), ("Order", order), ("SharedWidget", widget),
+                        ("User", user)):
+        _add(db, "shop", "app/Models/%s.php" % name, models=[model],
+             symbols=[SymbolRow(name=name, kind="class", line_start=9, line_end=30)])
+    _add(db, "shop", "app/Http/Controllers/ShipmentController.php",
+         symbols=[SymbolRow(name="ShipmentController", kind="class", line_start=9, line_end=60),
+                  SymbolRow(name="store", kind="method", parent="ShipmentController", line_start=20, line_end=30),
+                  SymbolRow(name="storeFromOrder", kind="method", parent="ShipmentController", line_start=31,
+                            line_end=40, signature="storeFromOrder(Order $order)")],
+         imports=[("App\\Models\\Shipment", ["Shipment"]),
+                  ("App\\Models\\Order", ["Order"])])
+    _add(db, "shop", "app/Http/Controllers/SharedWidgetController.php",
+         symbols=[SymbolRow(name="SharedWidgetController", kind="class", line_start=9, line_end=60),
+                  SymbolRow(name="index", kind="method", parent="SharedWidgetController", line_start=20,
+                            line_end=30)],
+         imports=[("App\\Models\\SharedWidget", ["SharedWidget"])])
+    # contrôleur absent de l'index : seul son nom parle ; contrôleur sans rapport avec aucun modèle : rien
+    routes = _add(db, "shop", "routes/api.php", endpoints=[
+        Graph.server("POST", "/shipments", "ShipmentController@store", line=10),
+        Graph.server("POST", "/orders/{order}/shipment", "ShipmentController@storeFromOrder", line=11),
+        Graph.server("GET", "/shared-widgets", "SharedWidgetController@index", line=12),
+        Graph.server("GET", "/users", "UsersController@index", line=13),
+        Graph.server("GET", "/references/{table}", "ReferenceController@index", line=14),
+        Graph.server("GET", "/status", "closure", line=15),
+    ], imports=[("App\\Http\\Controllers\\ShipmentController", ["ShipmentController"]),
+                ("App\\Http\\Controllers\\SharedWidgetController", ["SharedWidgetController"])])
+    resolve_imports(db, ws)
+    link_handlers(db, ws)
+    link_models(db, ws)
+    uses = _relations(db, "uses_model")
+    by_path = {(e.method, e.path): node_key("endpoint", int(e.id)) for e in db.list_endpoints(side="server")}
+    g, i, c, u = (node_key("model", int(m.id)) for m in (shipment, order, widget, user))
+    # le fichier de routes n'utilise rien ; chaque route utilise le modèle de son contrôleur
+    assert not any(src == node_key("file", routes) for src, _dst in uses)
+    store = uses[(by_path[("POST", "/shipments")], g)]
+    assert store.confidence == 0.6
+    assert store.meta == {"rule": "handler", "handler": "ShipmentController@store", "via": "name"}
+    assert uses[(by_path[("POST", "/orders/{order}/shipment")], g)].meta["via"] == "name"
+    # le contrôleur importe Order : ses routes l'utilisent aussi (via l'import), jamais SharedWidget
+    assert uses[(by_path[("POST", "/shipments")], i)].meta["via"] == "import"
+    assert (by_path[("POST", "/shipments")], c) not in uses
+    assert (by_path[("GET", "/shared-widgets")], g) not in uses
+    assert uses[(by_path[("GET", "/shared-widgets")], c)].meta["via"] == "name"
+    # pluriel (UsersController → User) sans fichier de contrôleur indexé ; ReferenceController et closure : rien
+    assert uses[(by_path[("GET", "/users")], u)].meta["via"] == "name"
+    assert not any(src == by_path[("GET", "/references/{table}")] for src, _dst in uses)
+    assert not any(src == by_path[("GET", "/status")] for src, _dst in uses)
+    # usages de Shipment : ses deux routes, son contrôleur (import) et rien d'autre
+    assert {src for (src, dst) in uses if dst == g} == {by_path[("POST", "/shipments")],
+                                                        by_path[("POST", "/orders/{order}/shipment")],
+                                                        node_key("file", db.get_file("shop", "app/Http/Controllers/ShipmentController.php").id)}
+    # idempotent
+    before = _snapshot(db)
+    link_models(db, ws)
+    assert _snapshot(db) == before
+
+
+def test_link_models_same_entity_never_crosses_table_prefixes(db: Database, tmp_path: Path):
+    """Non-régression (``same_entity``) : un modèle n'est relié qu'à sa table exacte (ou son pluriel snake_case
+    exact), jamais à une table homonyme portant un autre préfixe (``legacy_emprunt`` d'un dump SQL d'un autre
+    système ≠ ``emprunts``). Entité inventée (bibliothèque) : aucune donnée d'un projet réel ici."""
+    ws = _laravel_module(db, tmp_path / "shop")
+    emprunt = ModelRow(name="Emprunt", kind="eloquent", table_name="emprunts", line=9, fields=[{"name": "date_retour"}])
+    migration = ModelRow(name="emprunts", kind="migration", table_name="emprunts", line=11, fields=[{"name": "id"}])
+    dump = ModelRow(name="legacy_emprunt", kind="sql_table", table_name="legacy_emprunt", line=3, fields=[{"name": "id"}])
+    legacy = ModelRow(name="emprunt", kind="sql_table", table_name="emprunt", line=40, fields=[{"name": "id"}])
+    other = ModelRow(name="emprunt_motifs", kind="sql_table", table_name="emprunt_motifs", line=60, fields=[{"name": "id"}])
+    _add(db, "shop", "app/Models/Emprunt.php", models=[emprunt],
+         symbols=[SymbolRow(name="Emprunt", kind="class", line_start=9, line_end=30)])
+    _add(db, "shop", "database/migrations/2026_02_04_create_emprunts_table.php", models=[migration])
+    _add(db, "shop", "docker/migration/legacy_dump.sql", language="sql", models=[dump, legacy, other])
+    link_models(db, ws)
+    same = _relations(db, "same_entity")
+    e, mig, d, l, o = (node_key("model", int(m.id)) for m in (emprunt, migration, dump, legacy, other))
+    assert _undirected(same, e, mig).confidence == 0.9 and _undirected(same, e, mig).meta["rule"] == "same_table"
+    assert _undirected(same, e, l).confidence == 0.8 and _undirected(same, e, l).meta["rule"] == "name_to_table"
+    assert _undirected(same, e, d) is None and _undirected(same, mig, d) is None
+    assert _undirected(same, e, o) is None and _undirected(same, mig, o) is None
+    assert _undirected(same, l, d) is None
+
+
 # --------------------------------------------------------------------------- documents et notes
 
 def test_link_documents_documented_by_and_mentions(graph: Graph):
@@ -835,6 +1032,136 @@ def test_link_documents_handles_repo_doc_files(graph: Graph):
     mentions = _relations(db, "mentions")
     assert (node_key("file", doc_fid), graph.fkey("backend", "app/Services/OrderService.php")) in mentions
     assert (node_key("file", doc_fid), node_key("file", doc_fid)) not in mentions
+
+
+def test_link_documents_ignores_texts_without_any_code_form(graph: Graph):
+    """Reproduction : « User-agent » de robots.txt reliait le modèle User, une fiche PDF reliait « customers »
+    à vingt migrations. Un texte qui ne cite aucun identifiant sous forme code ne documente pas le code."""
+    db = graph.db
+    # fichier machine : exclu par son nom, même si son contenu citait du code
+    robots = graph.add_file("backend", "public/robots.txt", "text", kind="doc",
+                            text="User-agent: *\n# voir OrderService::confirm\nDisallow: /orders/{order}/confirm\n")
+    # fiche de données (docx) : que des mots ordinaires homonymes de tables et de modèles, répétés
+    fiche = graph.add_file("backend", "storage/fiches/fiche-42.docx", "docx", kind="doc",
+                           text="Fiche Customer 42. Le Customer a passé trois orders ; ces orders sont livrées. "
+                                "Les orders en retard sont signalées au Customer.\n")
+    # document déposé du même acabit
+    doc = graph._document("Fiche client", "Le Customer 42 a passé trois orders. Les orders sont livrées. "
+                                          "Customer satisfait, orders closes.")
+    link_documents(db, graph.workspace)
+    documented = _relations(db, "documented_by")
+    mentions = _relations(db, "mentions")
+    for dst in (node_key("file", robots), node_key("file", fiche), node_key("document", doc)):
+        assert not any(d == dst for _src, d in documented), dst
+        assert not any(s == dst for s, _dst in mentions), dst
+    # contrôle : le même mot ordinaire compte dès qu'un identifiant sous forme code accompagne le texte
+    readme = graph.add_file("backend", "docs/fiches.md", "markdown", kind="doc",
+                            text="Les orders sont confirmées par `OrderService::confirm` ; les orders livrées "
+                                 "sont archivées.\n")
+    link_documents(db, graph.workspace)
+    assert ("table:orders", node_key("file", readme)) in _relations(db, "documented_by")
+
+
+def test_link_documents_plain_word_needs_repetition_and_names_the_table_only(graph: Graph):
+    """Un mot ordinaire homonyme d'une table (« orders ») doit être répété (MIN_WEAK_MENTIONS) et ne relie
+    que la table, pas chaque migration / DDL qui la définit ; une forme code relie dès une occurrence."""
+    db = graph.db
+    assert MIN_WEAK_MENTIONS == 2
+    doc_fid = graph.add_file("backend", "docs/flux.md", "markdown", kind="doc",
+                             text="Les orders sont confirmées par `OrderService::confirm`, puis les orders partent "
+                                  "en expédition. Chaque Customer est prévenu ; le Customer peut annuler. "
+                                  "Les customers inactifs sont purgés.\n")
+    link_documents(db, graph.workspace)
+    documented = _relations(db, "documented_by")
+    dst = node_key("file", doc_fid)
+    # « orders » ×2 → la table seulement
+    rel = documented[("table:orders", dst)]
+    assert rel.meta["mentions"] == 2 and rel.meta["shape"] == "word" and rel.meta["kind"] == "table"
+    assert (graph.mkey("migration", "orders"), dst) not in documented
+    assert (graph.mkey("sql_table", "orders"), dst) not in documented
+    # « Customer » ×2 → la classe métier (pas une définition de table) reste reliée
+    assert (graph.mkey("eloquent", "Customer"), dst) in documented
+    # « customers » ×1 → rien ; la forme code `OrderService::confirm` ×1 → reliée
+    assert ("table:customers", dst) not in documented
+    assert (graph.mkey("sql_table", "customers"), dst) not in documented
+    rel = documented[(graph.skey("OrderService.confirm"), dst)]
+    assert rel.meta["mentions"] == 1 and rel.meta["shape"] == "qualified"
+    # mentions : le fichier de la migration n'est pas « mentionné » par un mot ordinaire
+    mentions = _relations(db, "mentions")
+    assert (dst, graph.fkey("backend", "app/Services/OrderService.php")) in mentions
+    assert (dst, graph.fkey("backend", "database/migrations/2024_01_01_000000_create_orders_table.php")) not in mentions
+    assert (dst, graph.fkey("backend", "app/Models/Customer.php")) in mentions
+    # la forme code garde les modèles qui définissent la table (comportement inchangé pour `orders`)
+    assert (graph.mkey("migration", "orders"), node_key("document", graph.documents["dictionnaire"])) in documented
+
+
+def test_link_documents_skips_names_shared_by_too_many_nodes(graph: Graph):
+    """« created_at » cité une fois reliait un README à 78 modèles ; un nom porté par plus de MAX_HOMONYMS noeuds
+    d'un même genre n'en documente aucun, les autres mentions du même texte restent reliées."""
+    db = graph.db
+    assert MAX_HOMONYMS == 5
+    many = [SymbolRow(name="render", kind="method", parent="View%d" % i, line_start=i + 1, line_end=i + 1)
+            for i in range(MAX_HOMONYMS + 1)]
+    graph.add_file("tools", "views.py", "python", symbols=many)
+    few = [ModelRow(name="audit_%d" % i, kind="migration", table_name="audit_%d" % i, line=1,
+                    fields=[{"name": "created_at"}]) for i in range(MAX_HOMONYMS)]
+    graph.add_file("backend", "database/migrations/2025_01_01_000000_create_audit_tables.php", "php", models=few)
+    doc_fid = graph.add_file("backend", "docs/vues.md", "markdown", kind="doc",
+                             text="Chaque vue expose `render` ; la table `orders` porte `created_at`.\n")
+    link_documents(db, graph.workspace)
+    dst = node_key("file", doc_fid)
+    documented = _relations(db, "documented_by")
+    assert not any(src.startswith("symbol:") and d == dst for src, d in documented)  # 6 symboles « render »
+    assert ("table:orders", dst) in documented
+    mentions = _relations(db, "mentions")
+    assert (dst, graph.fkey("tools", "views.py")) not in mentions
+    # 5 champs homonymes (≤ MAX_HOMONYMS) : le fichier des migrations reste mentionné
+    assert (dst, graph.fkey("backend", "database/migrations/2025_01_01_000000_create_audit_tables.php")) in mentions
+
+
+def test_link_documents_links_only_documentation_files(graph: Graph):
+    """Reproduction : 431 factures générées sous ``docker/migration/media/`` (noms, adresses) et une
+    page GitLab « codes de récupération » enregistrée dans ``public/`` étaient reliées ``documented_by`` aux modèles
+    qu'elles citent, donc servies au modèle comme « documentation ». Un PDF / DOCX ne documente le projet qu'à la
+    racine du dépôt ou sous un dossier de documentation, même quand son texte cite des identifiants sous forme code."""
+    from develop.knowledge_graph.linker import DOCUMENTATION_DIR_NAMES, _is_documentary_file
+
+    db = graph.db
+    cited = "Référence `OrderService::confirm` sur la table `orders` (voir app/Services/OrderService.php).\n"
+    # contenus produits ou déposés hors documentation : jamais reliés, malgré les formes code citées
+    gitlab = graph.add_file("backend", "public/Two-factor Authentication · Account · User Settings · GitLab.pdf",
+                            "pdf", kind="doc", text="Recovery codes\n3f9a1c\n7b2d0e\n" + cited)
+    invoice = graph.add_file("backend", "public/facture-output.pdf", "pdf", kind="doc",
+                             text="Facture — NOM PRÉNOM, commande n° 000011123\n" + cited)
+    media = graph.add_file("backend", "docker/migration/media/media/4/12facture.docx", "docx", kind="doc",
+                           text=cited)
+    export = graph.add_file("backend", "storage/exports/commandes-2026.docx", "docx", kind="doc", text=cited)
+    # documentation du projet : racine du dépôt, dossier de documentation (à toute profondeur), texte rédigé
+    root_pdf = graph.add_file("backend", "cahier-des-charges.pdf", "pdf", kind="doc", text=cited)
+    guide = graph.add_file("backend", "public/documentation/guide-commandes.pdf", "pdf", kind="doc", text=cited)
+    manual = graph.add_file("backend", "Documentation/Manuel.docx", "docx", kind="doc", text=cited)
+    notes = graph.add_file("backend", "public/notes.txt", "text", kind="doc", text=cited)
+
+    link_documents(db, graph.workspace)
+    documented = _relations(db, "documented_by")
+    mentions = _relations(db, "mentions")
+    service = graph.fkey("backend", "app/Services/OrderService.php")
+    for fid in (gitlab, invoice, media, export):
+        dst = node_key("file", fid)
+        assert not any(d == dst for _src, d in documented), dst
+        assert not any(s == dst for s, _dst in mentions), dst
+    for fid in (root_pdf, guide, manual, notes):
+        dst = node_key("file", fid)
+        assert ("table:orders", dst) in documented and (graph.skey("OrderService.confirm"), dst) in documented, dst
+        assert (dst, service) in mentions, dst
+    # le prédicat seul : la règle ne dépend que du chemin et du langage
+    assert {"docs", "documentation", "wiki"} <= DOCUMENTATION_DIR_NAMES
+    assert _is_documentary_file("public/documentation/specification-formulaires-commandes.pdf", "pdf")
+    assert _is_documentary_file("docs/guide.pdf", "PDF") and _is_documentary_file("rapport.pdf", "pdf")
+    assert _is_documentary_file("README.md", "markdown") and _is_documentary_file("public/geo/README.md", "markdown")
+    assert not _is_documentary_file("public/facture.pdf", "pdf")
+    assert not _is_documentary_file("docker/migration/media/media/4/x.docx", "docx")
+    assert not _is_documentary_file("public/robots.txt", "text") and not _is_documentary_file("", "pdf")
 
 
 # --------------------------------------------------------------------------- mentions et dérive
@@ -1029,7 +1356,7 @@ def test_link_handlers_completes_cross_file_handles_and_keeps_raw_ones(graph: Gr
     handles = _relations(db, "handles")
     rel = handles[(route, graph.skey("OrderController.confirm"))]
     assert rel.confidence == 0.9 and rel.meta == {"handler": "OrderController@confirm", "rule": "linker", "ambiguous": False}
-    assert handles[(customers, graph.skey("OrderController"))].confidence == 1.0  # brute intacte, pas de doublon
+    assert handles[(customers, graph.skey("OrderController"))].confidence == 1.0  # brute inchangée, pas de doublon
     # closures, routes Express sans gestionnaire nommé, contrôleur absent de l'index : rien
     assert not any(src == graph.ekey("server", "GET", "/status") for src, _dst in handles)
     assert not any(src == graph.ekey("server", "POST", "/notifications") for src, _dst in handles)
@@ -1259,9 +1586,18 @@ def test_integration_real_index_of_sample_project(develop_home: Path, project: P
         assert (f("backend", "app/Models/Order.php"), order[3]) not in uses
         assert (f("backend", "routes/api.php"), order[3]) not in uses
         assert (f("frontend", "src/api/client.ts"), order[0]) not in uses
+        # les routes d'OrderController utilisent Order (relation sur la route, pas sur routes/api.php) ; celles de
+        # CustomerController, déclarées dans le même fichier, non
+        assert not any(src == f("backend", "routes/api.php") for src, _dst in uses)
+        confirm = _endpoint(db, "server", "POST", "/orders/{order}/confirm", "backend")
+        rel = uses[(node_key("endpoint", confirm.id), order[0])]
+        assert rel.meta["rule"] == "handler" and rel.meta["handler"].startswith("OrderController")
+        customers = [node_key("endpoint", e.id) for e in db.list_endpoints(side="server")
+                     if "customers" in (e.path or "") and db.get_file_by_id(int(e.file_id)).repo_id == "backend"]
+        assert customers and not any((c, order[0]) in uses for c in customers)
         models_file = {int(row.id): int(row.file_id) for row in db.list_models() if row.id is not None}
         for src, dst in uses:
-            assert db.get_file_by_id(int(src[len("file:"):])).repo_id == \
+            assert db.get_file_by_id(_source_file_id(db, src)).repo_id == \
                 db.get_file_by_id(models_file[int(dst[len("model:"):])]).repo_id, (src, dst)
 
         # le dictionnaire de données (dépôt docs) est documented_by de la table orders et d'OrderService

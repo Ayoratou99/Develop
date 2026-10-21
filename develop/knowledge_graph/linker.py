@@ -14,15 +14,32 @@ genre                   src → dst                               règle
                                                                 même fichier ou d'un fichier importé (0.5–0.8)
 ``calls_endpoint``      ``endpoint:client`` → ``endpoint:srv``  appel HTTP ↔ route, confiance graduée
 ``same_entity``         ``model:X`` → ``model:Y``               même table / même entité (0.9, 0.8, 0.7)
-``uses_model``          ``file:A`` → ``model:M``                import du fichier du modèle, nom cité dans
-                                                                le dépôt de M (0.6)
-``documented_by``       noeud → ``document:D`` / ``note:N``     identifiant cité dans le texte (0.9)
+``uses_model``          ``file:A`` → ``model:M``                import du fichier du modèle, relation déclarée
+                                                                par un modèle, nom exact cité dans le dépôt
+                                                                de M (0.6)
+``uses_model``          ``endpoint:E`` → ``model:M``            route serveur gérée par ``<M>Controller`` ou
+                                                                par un contrôleur qui importe M (0.6)
+``documented_by``       noeud → ``document:D`` / ``note:N``     identifiant cité sous forme code, ou mot
+                                                                ordinaire répété, dans le texte (0.9)
 ``mentions``            ``document:D`` / ``note:N`` → ``file:F``  fichier dont des éléments sont cités (0.7)
 ======================  ======================================  ==========================================
 
 Les fichiers de documentation des dépôts (``files.kind == 'doc'`` : README, ``docs/*.md``…) sont
 traités comme des documents : ils reçoivent les mêmes relations avec ``file:<id>`` pour destination
-(``documented_by``) ou source (``mentions``).
+(``documented_by``) ou source (``mentions``). Les fichiers texte destinés aux machines
+(:data:`NON_DOCUMENTARY_FILES` : ``robots.txt``…) sont ignorés, et un PDF / DOCX ne compte comme
+documentation qu'à la racine du dépôt ou sous un dossier de documentation
+(:data:`DOCUMENTATION_DIR_NAMES` : ``docs/``, ``public/documentation/``…) : une attestation générée
+dans ``public/``, une page web enregistrée ou un export sous ``storage/`` citent des modèles et des
+tables sans les documenter (voir :func:`_is_documentary_file`).
+
+Un texte ne documente le code que s'il cite **au moins un identifiant sous forme code** présent dans
+l'index (accents graves, CamelCase, snake_case, ``Classe::méthode``, route, chemin) : une fiche, un
+formulaire, un PDF générique ou ``robots.txt`` (« User-agent ») ne mentionnent que des mots ordinaires
+et ne créent aucune relation. Un mot ordinaire homonyme d'une table ou d'un modèle (« customers »,
+« User ») ne compte qu'à partir de :data:`MIN_WEAK_MENTIONS` occurrences et ne relie que la table,
+pas chacune des migrations qui la définissent. Un nom porté par plus de :data:`MAX_HOMONYMS` noeuds
+d'un même genre (``created_at`` → des dizaines de champs, ``map``) n'en documente aucun.
 
 Le genre brut ``handles`` posé par l'indexeur (gestionnaire du même fichier) est conservé tel quel ;
 :func:`link_handlers` le complète quand le gestionnaire d'une route est défini dans un autre fichier
@@ -53,15 +70,21 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 from develop.code_analysis.model import normalize_route_path
 from develop.config import RepoConfig, WorkspaceConfig
-from develop.knowledge_graph.mentions import MAX_MENTIONS, NameIndex, match_candidates, scan_text, source_text
+from develop.knowledge_graph.mentions import (MAX_MENTIONS, Mention, NameIndex, match_candidates, scan_text,
+                                              source_text)
 from develop.project_scanner import read_text
+from develop.project_scanner.languages import TEXTLESS_LANGUAGES
 from develop.storage import Database, EndpointRow, FileRow, ModelRow, RelationRow, node_key
 
 __all__ = [
     "CALLABLE_KINDS",
     "DERIVED_KINDS",
+    "DOCUMENTATION_DIR_NAMES",
     "GENERIC_PREFIXES",
     "LinkStats",
+    "MAX_HOMONYMS",
+    "MIN_WEAK_MENTIONS",
+    "NON_DOCUMENTARY_FILES",
     "describe_relation",
     "learn_base_prefixes",
     "link_all",
@@ -115,6 +138,21 @@ TABLE_LIKE_KINDS = frozenset({"sql_table", "migration"})
 #: Confiance minimale et nombre maximal de routes candidates conservées par appel client.
 MIN_ENDPOINT_CONFIDENCE = 0.4
 MAX_ENDPOINT_CANDIDATES = 3
+#: Occurrences minimales d'un mot ordinaire (sans forme code : « customers », « User ») pour qu'il
+#: documente la table ou le modèle homonyme.
+MIN_WEAK_MENTIONS = 2
+#: Au-delà de ce nombre de noeuds homonymes d'un même genre, une mention n'en documente aucun.
+MAX_HOMONYMS = 5
+#: Fichiers texte destinés aux machines (``files.kind == 'doc'`` par extension), jamais reliés comme documentation.
+NON_DOCUMENTARY_FILES = frozenset({"robots.txt", "humans.txt", "security.txt", "ads.txt", "app-ads.txt",
+                                   "sitemap.txt"})
+#: Dossiers (segment de chemin, insensible à la casse) sous lesquels un PDF / DOCX d'un dépôt est de la
+#: documentation du projet (``docs/guide.pdf``, ``public/documentation/parametrage.pdf``, ``wiki/``…) ;
+#: ailleurs, un document binaire est un contenu produit ou déposé par l'application, jamais relié.
+DOCUMENTATION_DIR_NAMES = frozenset({
+    "doc", "docs", "documentation", "wiki", "guide", "guides", "manual", "manuals", "handbook", "spec", "specs",
+    "specification", "specifications", "rfc", "rfcs", "adr", "adrs", "design", "notes",
+})
 _UNKNOWN_METHODS = frozenset({"", "ANY", "*"})
 _LARGE_LIMIT = 10_000_000
 _MIN_MODEL_NAME = 4
@@ -137,6 +175,11 @@ _PROXY_BLOCK_RE = re.compile(r"\bproxy\s*:\s*\{")
 _PROXY_KEY_RE = re.compile(r"['\"](/[A-Za-z0-9_\-/]*)['\"]\s*:")
 _SCHEME_HOST_RE = re.compile(r"^[a-z][a-z0-9+.-]*://[^/]*", re.IGNORECASE)
 _PHP_SUFFIXES = ("Model", "Entity", "Dto", "DTO", "Record", "Row", "Schema", "Table", "Type", "Interface", "Resource")
+#: Suffixes d'une classe gestionnaire de routes, retirés pour retrouver l'entité qu'elle sert
+#: (``ShipmentController`` → ``Shipment``, ``UsersResource`` → ``Users``) ; du plus long au plus court.
+_HANDLER_SUFFIXES: Tuple[str, ...] = ("ApiController", "Controller", "Controllers", "Resources", "Resource", "Handlers",
+                                      "Handler", "Endpoints", "Endpoint", "Router", "Routes", "ViewSet", "Views", "View",
+                                      "Api")
 
 
 # --------------------------------------------------------------------------- statistiques
@@ -1459,23 +1502,38 @@ def _language_family(language: Optional[str]) -> str:
     return lang
 
 
-def _name_candidates(models: Sequence[ModelRow], owner: FileRow, files: Dict[int, FileRow]) -> List[ModelRow]:
+def _name_candidates(models: Sequence[ModelRow], owner: FileRow, files: Dict[int, FileRow],
+                     exclude_own: bool = True) -> List[ModelRow]:
     """Modèles homonymes qu'un fichier peut « utiliser » par leur nom.
 
     Seuls les modèles du **même dépôt** que le fichier sont retenus (une interface TS du frontend
     n'est jamais « utilisée » par un fichier PHP du backend parce que les noms coïncident) ; dans
     un monodépôt où frontend et backend cohabitent, les modèles définis dans la même famille de
-    langage que le fichier (:data:`_LANGUAGE_FAMILIES`) l'emportent quand il y en a.
+    langage que le fichier (:data:`_LANGUAGE_FAMILIES`) l'emportent quand il y en a. Les modèles
+    définis dans le fichier lui-même sont écartés sauf si ``exclude_own`` est faux (route d'un
+    fichier qui définit aussi le modèle).
     """
     same_repo: List[Tuple[ModelRow, Optional[str]]] = []
     for m in models:
         model_file = files.get(int(m.file_id)) if m.file_id is not None else None
-        if model_file is None or model_file.repo_id != owner.repo_id or model_file.id == owner.id:
+        if model_file is None or model_file.repo_id != owner.repo_id:
+            continue
+        if exclude_own and model_file.id == owner.id:
             continue
         same_repo.append((m, model_file.language))
     family = _language_family(owner.language)
     close = [m for m, language in same_repo if _language_family(language) == family]
     return close if close else [m for m, _language in same_repo]
+
+
+def _handler_entity(cls: str) -> str:
+    """Entité servie par une classe gestionnaire : ``ShipmentController`` → ``Shipment``,
+    ``Api\\V1\\UsersResource`` → ``Users`` ; le nom lui-même s'il ne porte aucun suffixe connu."""
+    name = _short_name(cls)
+    for suffix in _HANDLER_SUFFIXES:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)]
+    return name
 
 
 def _split_handler(handler: str) -> Tuple[Optional[str], str]:
@@ -1498,10 +1556,17 @@ def link_models(db: Database, workspace: WorkspaceConfig, errors: Optional[List[
     ``order_lines``) → 0.8 (0.6 après retrait d'un suffixe ``Model``/``Dto``/``Row``…) ;
     interface ou type TS (ou toute classe) de même nom qu'un modèle serveur d'un autre genre →
     0.7. (b) ``uses_model`` (``file:A`` → ``model:M``, 0.6) : A importe le fichier définissant M
-    (relations ``imports``, en respectant les noms importés), ou le nom de M (≥ 4 caractères,
-    mot entier, insensible à la casse) apparaît dans un symbole, une signature ou un gestionnaire
-    d'endpoint de A, ou un endpoint de A est géré par une classe (du même dépôt) dont le fichier
-    utilise M. La règle du nom reste dans le **dépôt de M** : les modèles homonymes d'autres
+    (relations ``imports``, en respectant les noms importés, ``rule='import'``) ; un modèle
+    défini dans A déclare une relation vers M (``hasOne(Shipment::class)``, ``'relation'``) ; ou
+    le nom **exact** de M (≥ 4 caractères, mot entier délimité par ``[A-Za-z0-9_$]``, sensible
+    à la casse : ``Shipment`` ne correspond ni à ``shipments``, ni à ``ShipmentController``, ni
+    à la variable ``$shipment``) apparaît dans un symbole, une signature ou un gestionnaire
+    d'endpoint de A (``'name'``). (c) ``uses_model`` (``endpoint:E`` → ``model:M``, 0.6,
+    ``rule='handler'``) : la route serveur E est gérée par une classe nommée d'après M
+    (``<M>Controller``, ``<M>sResource``… : ``meta.via == 'name'``) ou par une classe dont le
+    fichier, du même dépôt, importe M (``meta.via == 'import'``) ; la relation porte sur la route
+    elle-même, jamais sur le fichier de routes (qui en déclare des dizaines pour d'autres
+    modèles). La règle du nom reste dans le **dépôt de M** : les modèles homonymes d'autres
     dépôts (``Order`` eloquent du backend ↔ interface TS ``Order`` du frontend) sont déjà reliés
     par ``same_entity`` et ne sont jamais « utilisés » par simple coïncidence de nom ; un fichier
     n'utilise pas non plus un homonyme d'un modèle qu'il définit lui-même (son propre nom
@@ -1560,7 +1625,8 @@ def link_models(db: Database, workspace: WorkspaceConfig, errors: Optional[List[
                              meta={"rule": rule, "detail": detail}) for (a, b), (conf, rule, detail) in pairs.items()]
 
     # ----- uses_model -----
-    uses: Dict[Tuple[int, int], str] = {}
+    uses: Dict[Tuple[int, int], str] = {}  # (fichier, modèle) → règle
+    endpoint_uses: Dict[Tuple[int, int], Dict[str, Any]] = {}  # (route serveur, modèle) → meta
     try:
         models_by_file: Dict[int, List[ModelRow]] = {}
         class_like: List[ModelRow] = []
@@ -1589,12 +1655,30 @@ def link_models(db: Database, workspace: WorkspaceConfig, errors: Optional[List[
                         continue
                     uses.setdefault((a, int(m.id)), "import")  # type: ignore[arg-type]
 
+        by_exact: Dict[str, List[ModelRow]] = {}
+        for m in class_like:
+            by_exact.setdefault(m.name, []).append(m)
+        # relation déclarée par un modèle (``hasOne(Shipment::class)``) : son fichier utilise le modèle cible
+        for m in models:
+            owner = files.get(int(m.file_id)) if m.file_id is not None else None
+            if owner is None:
+                continue
+            for rel in (m.relations or []):
+                target = _short_name(rel.get("target")) if isinstance(rel, dict) else ""
+                if not target or target == m.name:
+                    continue
+                for t in _name_candidates(by_exact.get(target, []), owner, files):
+                    uses.setdefault((int(m.file_id), int(t.id)), "relation")  # type: ignore[arg-type]
+
         blobs: Dict[int, List[str]] = {}
         class_files: Dict[str, List[int]] = {}
-        for r in db.query("SELECT file_id, name, kind, parent, signature FROM symbols"):
+        symbol_files: Dict[int, int] = {}
+        for r in db.query("SELECT id, file_id, name, kind, parent, signature FROM symbols"):
             fid = r["file_id"]
             if fid is None:
                 continue
+            if r["id"] is not None:
+                symbol_files[int(r["id"])] = int(fid)
             blobs.setdefault(int(fid), []).extend(x for x in (r["name"], r["parent"], r["signature"]) if x)
             if (r["kind"] or "") in ("class", "interface", "trait", "enum") and r["name"]:
                 class_files.setdefault(str(r["name"]).split("\\")[-1], []).append(int(fid))
@@ -1606,12 +1690,9 @@ def link_models(db: Database, workspace: WorkspaceConfig, errors: Optional[List[
             if ep.handler:
                 blobs.setdefault(int(ep.file_id), []).append(ep.handler)
         if class_like:
-            by_lower: Dict[str, List[ModelRow]] = {}
-            for m in class_like:
-                by_lower.setdefault(m.name.lower(), []).append(m)
-            names_sorted = sorted({m.name for m in class_like}, key=len, reverse=True)
-            pattern = re.compile(r"(?<![A-Za-z0-9_])(%s)(?![a-z0-9_])" % "|".join(re.escape(n) for n in names_sorted),
-                                 re.IGNORECASE)
+            names_sorted = sorted(by_exact, key=len, reverse=True)
+            # nom exact, mot entier : ni ``shipments``, ni ``ShipmentController``, ni la variable ``$shipment``
+            pattern = re.compile(r"(?<![A-Za-z0-9_$])(%s)(?![A-Za-z0-9_])" % "|".join(re.escape(n) for n in names_sorted))
             for fid, parts in blobs.items():
                 owner = files.get(fid)
                 if owner is None:
@@ -1621,34 +1702,60 @@ def link_models(db: Database, workspace: WorkspaceConfig, errors: Optional[List[
                 for found in set(pattern.findall(text)):
                     if found.lower() in own_names:
                         continue  # le fichier définit un modèle de ce nom : la correspondance n'est pas un usage
-                    for m in _name_candidates(by_lower.get(found.lower(), []), owner, files):
+                    for m in _name_candidates(by_exact.get(found, []), owner, files):
                         uses.setdefault((fid, int(m.id)), "name")  # type: ignore[arg-type]
-        # endpoint géré par une classe d'un autre fichier du même dépôt : le fichier des routes utilise ce que
-        # la classe utilise
-        uses_by_file: Dict[int, List[int]] = {}
-        for (fid, mid) in uses:
-            uses_by_file.setdefault(fid, []).append(mid)
+        # route serveur gérée par une classe nommée d'après le modèle (``ShipmentController``) ou par une classe
+        # dont le fichier (même dépôt) importe le modèle : la relation porte sur la route, jamais sur le fichier de
+        # routes, qui déclare des dizaines de routes d'autres modèles
+        uses_by_file: Dict[int, Dict[int, str]] = {}
+        for (fid, mid), rule in uses.items():
+            uses_by_file.setdefault(fid, {})[mid] = rule
+        handled_files: Dict[int, Set[int]] = {}  # route → fichiers de ses symboles gestionnaires (``handles``)
+        for r in db.query("SELECT src, dst FROM relations WHERE kind = 'handles'"):
+            src, dst = r["src"] or "", r["dst"] or ""
+            if not src.startswith("endpoint:") or not dst.startswith("symbol:"):
+                continue
+            try:
+                eid, sid = int(src[len("endpoint:"):]), int(dst[len("symbol:"):])
+            except ValueError:
+                continue
+            if sid in symbol_files:
+                handled_files.setdefault(eid, set()).add(symbol_files[sid])
+        by_entity: Dict[str, List[ModelRow]] = {}  # nom ou pluriel du modèle, en minuscules
+        for m in class_like:
+            by_entity.setdefault(m.name.lower(), []).append(m)
+            by_entity.setdefault(_plural(m.name).lower(), []).append(m)
         for fid, eps in endpoints_by_file.items():
             owner = files.get(fid)
             if owner is None:
                 continue
             for ep in eps:
-                if ep.side != "server" or not ep.handler:
+                if ep.side != "server" or not ep.handler or ep.id is None:
                     continue
                 cls, _meth = _split_handler(ep.handler)
                 if not cls:
                     continue
-                for gid in class_files.get(cls, []):
+                found_models: Dict[int, str] = {}
+                entity = _handler_entity(cls)
+                if entity:
+                    for m in _name_candidates(by_entity.get(entity.lower(), []), owner, files, exclude_own=False):
+                        found_models.setdefault(int(m.id), "name")  # type: ignore[arg-type]
+                for gid in set(class_files.get(cls, [])) | handled_files.get(int(ep.id), set()):
                     handler_file = files.get(gid)
-                    if gid == fid or handler_file is None or handler_file.repo_id != owner.repo_id:
+                    if handler_file is None or handler_file.repo_id != owner.repo_id:
                         continue
-                    for mid in uses_by_file.get(gid, []):
-                        uses.setdefault((fid, mid), "handler")
+                    for mid, rule in uses_by_file.get(gid, {}).items():
+                        if rule == "import":
+                            found_models.setdefault(mid, "import")
+                for mid, via in found_models.items():
+                    endpoint_uses[(int(ep.id), mid)] = {"rule": "handler", "handler": ep.handler, "via": via}
     except Exception as exc:  # noqa: BLE001
         log.add("liaison uses_model interrompue : %s" % exc)
 
     use_rows = [RelationRow(src=node_key("file", a), dst=node_key("model", b), kind="uses_model", confidence=0.6,
                             meta={"rule": rule}) for (a, b), rule in uses.items()]
+    use_rows += [RelationRow(src=node_key("endpoint", e), dst=node_key("model", b), kind="uses_model", confidence=0.6,
+                             meta=meta) for (e, b), meta in endpoint_uses.items()]
     with db.transaction():
         _delete_kinds(db, ["same_entity", "uses_model"])
         if same_rows:
@@ -1660,11 +1767,59 @@ def link_models(db: Database, workspace: WorkspaceConfig, errors: Optional[List[
 
 # --------------------------------------------------------------------------- documents et notes
 
+def _is_documentary_file(path: str, language: Optional[str] = None) -> bool:
+    """Vrai si un fichier ``kind == 'doc'`` d'un dépôt documente le projet (cible légitime de ``documented_by``).
+
+    * texte rédigé (Markdown, reStructuredText, ``.txt``) : partout (README, ``docs/*.md``, CHANGELOG…),
+      sauf les fichiers destinés aux machines (:data:`NON_DOCUMENTARY_FILES` : ``robots.txt``…) ;
+    * PDF / DOCX (:data:`TEXTLESS_LANGUAGES`) : seulement à la racine du dépôt ou sous un dossier de
+      documentation (:data:`DOCUMENTATION_DIR_NAMES`). Ailleurs (``public/``, ``storage/``, ``exports/``…)
+      ce sont des contenus produits ou déposés — attestations générées avec des noms réels, pages web
+      enregistrées avec des codes de récupération — qui citent des modèles sans les documenter : reliés
+      comme « documentation », ils remonteraient dans le contexte de chaque question sur ces modèles.
+    """
+    norm = (path or "").replace("\\", "/").strip("/").lower()
+    if not norm:
+        return False
+    segments = norm.split("/")
+    if segments[-1] in NON_DOCUMENTARY_FILES:
+        return False
+    if (language or "").lower() in TEXTLESS_LANGUAGES:
+        return len(segments) == 1 or any(seg in DOCUMENTATION_DIR_NAMES for seg in segments[:-1])
+    return True
+
+
+def _documented_nodes(index: NameIndex, mention: Mention) -> List[Tuple[str, str, Optional[int]]]:
+    """Noeuds qu'une mention documente vraiment.
+
+    Un mot ordinaire qui nomme une table (« customers ») désigne la table, pas chacune des migrations
+    ou DDL qui la définissent (:attr:`NameIndex.definition_models`) ; une forme code (``customers`` en
+    accents graves) garde ses modèles. Un nom porté par plus de :data:`MAX_HOMONYMS` noeuds d'un même
+    genre (``created_at`` dans des dizaines de modèles, ``map``) est trop ambigu pour en documenter un.
+    """
+    nodes = list(mention.nodes)
+    if not mention.strong and any(kind == "table" for kind, _key, _fid in nodes):
+        nodes = [n for n in nodes
+                 if not (n[0] == "model" and n[1].startswith("model:") and n[1][len("model:"):].isdigit()
+                         and int(n[1][len("model:"):]) in index.definition_models)]
+    per_kind: Dict[str, int] = {}
+    for kind, _key, _fid in nodes:
+        per_kind[kind] = per_kind.get(kind, 0) + 1
+    return [n for n in nodes if per_kind[n[0]] <= MAX_HOMONYMS]
+
+
 def _document_relations(index: NameIndex, source_type: str, source_id: int, text: str) -> List[RelationRow]:
-    """Relations ``documented_by`` et ``mentions`` d'un texte (document, note ou fichier de documentation)."""
+    """Relations ``documented_by`` et ``mentions`` d'un texte (document, note ou fichier de documentation).
+
+    Rien si le texte ne cite aucun identifiant sous forme code présent dans l'index (fiche, formulaire,
+    PDF générique, ``robots.txt``) ; un mot ordinaire ne compte qu'à partir de :data:`MIN_WEAK_MENTIONS`
+    occurrences ; voir :func:`_documented_nodes` pour les noeuds retenus par mention.
+    """
     dst = node_key(source_type, source_id)
     self_file = int(source_id) if source_type == "file" else None
     mentions = match_candidates(index, scan_text(text), limit=MAX_MENTIONS)
+    if not any(m.exists and m.strong for m in mentions):
+        return []  # aucun identifiant sous forme code : ce texte ne documente pas le code
     rows: List[RelationRow] = []
     seen: Set[str] = set()
     files_hit: Dict[int, Dict[str, Any]] = {}
@@ -1681,7 +1836,9 @@ def _document_relations(index: NameIndex, source_type: str, source_id: int, text
     for m in mentions:
         if not m.exists:
             continue
-        for kind, key, file_id in m.nodes:
+        if not m.strong and m.count < MIN_WEAK_MENTIONS:
+            continue  # « User » dans « User-agent », « customers » une fois dans une fiche : pas une documentation
+        for kind, key, file_id in _documented_nodes(index, m):
             if kind == "file":
                 hit_file(int(key[len("file:"):]), m.name, m.count, direct=True)
                 continue
@@ -1692,7 +1849,7 @@ def _document_relations(index: NameIndex, source_type: str, source_id: int, text
                 continue
             seen.add(key)
             rows.append(RelationRow(src=key, dst=dst, kind="documented_by", confidence=0.9,
-                                    meta={"mentions": m.count, "name": m.name, "kind": kind}))
+                                    meta={"mentions": m.count, "name": m.name, "kind": kind, "shape": m.shape}))
             hit_file(file_id, m.name, m.count)
     for fid, entry in files_hit.items():
         rows.append(RelationRow(src=dst, dst=node_key("file", fid), kind="mentions",
@@ -1708,9 +1865,15 @@ def link_documents(db: Database, workspace: WorkspaceConfig, errors: Optional[Li
     (``kind == 'doc'`` : README, ``docs/*.md``…) : identifiants candidats du texte (voir
     :mod:`develop.knowledge_graph.mentions`), correspondance exacte insensible à la casse avec
     les symboles, modèles, tables, endpoints et fichiers de l'index → ``documented_by``
-    (``symbol:|model:|endpoint:|table:`` → ``document:|note:|file:``, 0.9, ``meta={mentions: n}``)
-    et ``mentions`` (``document:|note:|file:`` → ``file:``, 0.7, ou 0.9 si le chemin du fichier est
-    cité). Au plus 200 mentions par document ; l'index des noms est construit une fois.
+    (``symbol:|model:|endpoint:|table:`` → ``document:|note:|file:``, 0.9, ``meta={mentions: n, name,
+    kind, shape}``) et ``mentions`` (``document:|note:|file:`` → ``file:``, 0.7, ou 0.9 si le chemin du
+    fichier est cité). Au plus 200 mentions par document ; l'index des noms est construit une fois.
+
+    Garde-fous contre le bruit (voir :func:`_document_relations`) : un texte sans identifiant sous
+    forme code ne crée rien ; un mot ordinaire doit être répété (:data:`MIN_WEAK_MENTIONS`) et ne
+    relie que la table ; un nom trop partagé (:data:`MAX_HOMONYMS`) ne relie rien ; les fichiers
+    machine (:data:`NON_DOCUMENTARY_FILES`) et les PDF / DOCX hors des dossiers de documentation
+    (:data:`DOCUMENTATION_DIR_NAMES`) sont ignorés (voir :func:`_is_documentary_file`).
     Renvoie le nombre de documents, notes et fichiers de documentation reliés à au moins un élément.
     """
     log = _Errors(errors)
@@ -1720,7 +1883,8 @@ def link_documents(db: Database, workspace: WorkspaceConfig, errors: Optional[Li
     sources: List[Tuple[str, int]] = []
     sources += [("document", int(d.id)) for d in db.list_documents(limit=_LARGE_LIMIT) if d.id is not None]
     sources += [("note", int(n.id)) for n in db.list_notes(limit=_LARGE_LIMIT) if n.id is not None]
-    sources += [("file", int(f.id)) for f in db.list_files(kind="doc") if f.id is not None]
+    sources += [("file", int(f.id)) for f in db.list_files(kind="doc")
+                if f.id is not None and _is_documentary_file(f.path or "", f.language)]
     for source_type, source_id in sources:
         try:
             text = source_text(db, source_type, source_id)

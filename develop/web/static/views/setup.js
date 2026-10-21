@@ -311,9 +311,30 @@ export function repoEditor(repos, onChange) {
 
 // --------------------------------------------------------------------------- moteur d'IA
 
-function machineCard() {
+/**
+ * num_ctx conseillé d'après la RAM totale (Go), à défaut de la suggestion de POST /api/llm/test :
+ * ≥ 32 Go → 16 384 ; ≥ 16 Go → 8 192 ; en dessous → 4 096 ; null si la RAM est inconnue.
+ */
+export function adviseNumCtx(ramTotalGb) {
+  const ram = Number(ramTotalGb);
+  if (!ram || Number.isNaN(ram) || ram <= 0) return null;
+  if (ram >= 32) return 16384;
+  if (ram >= 16) return 8192;
+  return 4096;
+}
+
+/** Avertissement quand le modèle testé n'a pas la capacité « tools » (`model_info.supports_tools` false) ; null sinon. */
+export function toolsWarning(info) {
+  if (!info || info.supports_tools !== false) return null;
+  return infoBox(el('div',
+    info.name ? el('div', { style: { fontWeight: '600' } }, info.name) : null,
+    el('div', 'Ce modèle ne sait pas appeler les outils de Develop : les réponses s\'appuieront seulement sur la recherche initiale ; préférez un modèle avec outils (qwen3.5:9b, gemma4:12b, devstral).')), 'warn');
+}
+
+/** Carte « Votre machine » ; `profilePromise` : GET /api/system/profile partagé avec le formulaire moteur. */
+function machineCard(profilePromise) {
   const card = el('div', { class: 'card' }, el('div', { class: 'card-title' }, 'Votre machine'), spinner('Analyse de la machine…'));
-  api.get('/api/system/profile').then((p) => {
+  profilePromise.then((p) => {
     const gpus = (p.gpus || []).map((g) => g.name + (g.vram_gb ? ` (${g.vram_gb} Go)` : '')).join(', ');
     replace(card,
       el('div', { class: 'card-title' }, 'Votre machine'),
@@ -413,13 +434,16 @@ function recommendationsCard(onPick = null, advisor = null) {
 }
 
 /**
- * Formulaire moteur d'IA : moteur, URL, modèle (liste rafraîchissable), embeddings, test.
- * `llm` est modifié en place ; `onChange()` prévient le parent.
+ * Formulaire moteur d'IA : moteur, URL, modèle (liste rafraîchissable), embeddings, réflexion interne
+ * (think), num_ctx avec valeur conseillée, test. `llm` est modifié en place ; `onChange()` prévient le parent.
  */
 export function engineForm(llm, onChange = () => {}) {
   if (!llm.engine) llm.engine = 'none';
   if (!llm.base_url) llm.base_url = DEFAULT_URLS[llm.engine] || '';
   let models = [];
+  let ramGb = null; // RAM totale (Go) d'après GET /api/system/profile
+  let ramAdvice = null; // num_ctx conseillé d'après la RAM
+  let testAdvice = null; // num_ctx suggéré par POST /api/llm/test pour le modèle courant (prioritaire)
 
   const engineSelect = el('select', { class: 'select' },
     el('option', { value: 'ollama', selected: llm.engine === 'ollama' }, 'Ollama'),
@@ -430,14 +454,30 @@ export function engineForm(llm, onChange = () => {}) {
   const modelList = el('datalist', { id: 'llm-model-list' });
   const modelInput = el('input', { class: 'input mono', type: 'text', list: 'llm-model-list', value: llm.model || '', placeholder: 'ex. qwen2.5-coder:7b' });
   const embedSelect = el('select', { class: 'select' });
+  const thinkInput = el('input', { type: 'checkbox', checked: !!llm.think });
   const ctxInput = el('input', { class: 'input', type: 'number', min: 1024, step: 1024, value: llm.num_ctx || 8192 });
+  const ctxAdvice = el('span'); // aide du champ num_ctx : « 16 384 conseillé sur cette machine » + rappel
   const modelsInfo = el('span', { class: 'muted small' });
   const testResult = el('div');
+  const toolsHost = el('div'); // avertissement « modèle sans capacité tools »
   const keyField = field('Clé API', keyInput);
 
   const refreshBtn = el('button', { class: 'btn btn-sm', type: 'button', onClick: () => loadModels() }, icon('refresh', 14), 'Rafraîchir');
   // Même libellé que les étapes d'installation du conseiller (« Vérifier »).
   const testBtn = el('button', { class: 'btn', type: 'button', onClick: () => runTest() }, 'Vérifier la connexion');
+
+  /** Aide du champ num_ctx : valeur conseillée (test du modèle, sinon RAM) avec bouton « Utiliser » si elle diffère. */
+  const renderCtxAdvice = () => {
+    const value = testAdvice || ramAdvice;
+    const origin = testAdvice ? 'fenêtre du modèle et mémoire de la machine' : (ramGb ? `${formatNumber(ramGb)} Go de mémoire` : '');
+    const current = Number(ctxInput.value) || 0;
+    replace(ctxAdvice,
+      value ? el('span', { class: 'ctx-advice' }, el('strong', `${formatNumber(value)} conseillé sur cette machine`), origin ? ` (${origin})` : '', '. ') : null,
+      'Un contexte trop grand ralentit fortement un modèle local ; trop petit, les sources ne tiennent pas dans la réponse.',
+      value && current !== value
+        ? [' ', el('button', { class: 'btn btn-sm', type: 'button', disabled: llm.engine === 'none', onClick: () => { ctxInput.value = value; sync(); } }, `Utiliser ${formatNumber(value)}`)]
+        : null);
+  };
 
   const sync = () => {
     llm.engine = engineSelect.value;
@@ -447,11 +487,30 @@ export function engineForm(llm, onChange = () => {}) {
     // Tant que la liste n'est pas rendue, le select n'a aucune option : ne pas écraser le
     // modèle d'embeddings enregistré par ''.
     if (embedSelect.options.length) llm.embedding_model = embedSelect.value;
+    llm.think = !!thinkInput.checked;
     llm.num_ctx = Number(ctxInput.value) || 8192;
     keyField.classList.toggle('hidden', llm.engine !== 'openai_compat');
     const disabled = llm.engine === 'none';
-    [urlInput, modelInput, embedSelect, ctxInput, refreshBtn, testBtn].forEach((n) => { n.disabled = disabled; });
+    [urlInput, modelInput, embedSelect, thinkInput, ctxInput, refreshBtn, testBtn].forEach((n) => { n.disabled = disabled; });
+    renderCtxAdvice();
     onChange();
+  };
+
+  /** Applique un résultat de POST /api/llm/test : num_ctx suggéré et avertissement « sans outils ». */
+  const applyTest = (r) => {
+    if (r && r.suggested_num_ctx) testAdvice = Number(r.suggested_num_ctx) || null;
+    renderCtxAdvice();
+    replace(toolsHost, toolsWarning(r && r.model_info));
+  };
+
+  /** Sonde silencieuse du modèle déjà configuré (au montage) : même résultat que le test, sans l'afficher. */
+  const probeModel = async () => {
+    if (llm.engine === 'none' || !llm.model) return;
+    const model = llm.model;
+    try {
+      const r = await api.post('/api/llm/test', { engine: llm.engine, base_url: llm.base_url, model, embedding_model: '', api_key: llm.api_key || '' });
+      if (llm.model === model) applyTest(r); // sinon le modèle a changé entre-temps
+    } catch (_) { /* moteur injoignable : « Vérifier la connexion » le dira */ }
   };
 
   const renderEmbeddings = () => {
@@ -497,6 +556,7 @@ export function engineForm(llm, onChange = () => {}) {
             ['Embeddings', llm.embedding_model ? (r.embedding_ok ? `OK (dimension ${r.embedding_dim || '?'})` : 'échec') : 'désactivés (recherche lexicale seule)'],
             r.suggested_num_ctx ? ['num_ctx suggéré', el('span', { class: 'row' }, formatNumber(r.suggested_num_ctx), el('button', { class: 'btn btn-sm', type: 'button', onClick: () => { ctxInput.value = r.suggested_num_ctx; sync(); } }, 'Utiliser'))] : null,
           ]))));
+      applyTest(r);
     } catch (e) {
       replace(testResult, errorBox(e));
     } finally {
@@ -511,7 +571,9 @@ export function engineForm(llm, onChange = () => {}) {
     loadModels();
   });
   [urlInput, keyInput, modelInput, ctxInput].forEach((n) => n.addEventListener('input', sync));
-  embedSelect.addEventListener('change', sync);
+  // Un autre modèle : la suggestion et l'avertissement du test précédent ne le concernent plus.
+  modelInput.addEventListener('input', () => { testAdvice = null; replace(toolsHost); renderCtxAdvice(); });
+  [embedSelect, thinkInput].forEach((n) => n.addEventListener('change', sync));
   urlInput.addEventListener('change', loadModels);
 
   const form = el('div', { class: 'card' },
@@ -521,9 +583,13 @@ export function engineForm(llm, onChange = () => {}) {
     keyField,
     field(el('span', { class: 'row' }, 'Modèle de chat', refreshBtn, modelsInfo), [modelInput, modelList], 'Choisissez un modèle installé ou saisissez son nom exact.'),
     field('Modèle d\'embeddings', embedSelect, 'Sans embeddings, la recherche reste fonctionnelle (lexicale + identifiants + graphe).'),
-    field('Fenêtre de contexte demandée (num_ctx)', ctxInput, 'Un contexte trop grand ralentit fortement un modèle local.'),
+    el('div', { class: 'field' },
+      el('label', { class: 'checkbox' }, thinkInput, el('span', 'Réflexion interne du modèle (think) : plus précis, 2 à 3 fois plus lent')),
+      el('div', { class: 'hint' }, 'Transmise seulement aux modèles qui la proposent (qwen3, deepseek-r1…) ; sans effet sur les autres.')),
+    field('Fenêtre de contexte demandée (num_ctx)', ctxInput, ctxAdvice),
     el('div', { class: 'row' }, testBtn),
-    testResult);
+    testResult,
+    toolsHost);
 
   const useEngine = (engine, baseUrl) => {
     engineSelect.value = engine;
@@ -564,15 +630,18 @@ export function engineForm(llm, onChange = () => {}) {
     if (advisor.steps && advisor.needsInstall) advisor.steps.open = true;
   };
 
+  const profilePromise = api.get('/api/system/profile');
   const root = el('div',
-    el('div', { class: 'card-grid' }, machineCard(), enginesCard(useEngine, onEnginesReport)),
+    el('div', { class: 'card-grid' }, machineCard(profilePromise), enginesCard(useEngine, onEnginesReport)),
     el('div', { style: { height: '14px' } }),
     recommendationsCard(onPick, advisor),
     form);
   // renderEmbeddings() AVANT le premier sync() : sinon le select vide écrase embedding_model.
   renderEmbeddings();
   sync();
-  if (llm.engine !== 'none') loadModels();
+  // num_ctx conseillé d'après la RAM tant que le modèle n'a pas été testé.
+  profilePromise.then((p) => { ramGb = p.ram_total_gb || null; ramAdvice = adviseNumCtx(ramGb); renderCtxAdvice(); }).catch(() => {});
+  if (llm.engine !== 'none') { loadModels(); probeModel(); }
   return root;
 }
 
@@ -753,7 +822,7 @@ export async function mount(root, route) {
   // Reprise : si un espace existe déjà, on pré-remplit l'assistant.
   const draft = existing
     ? { id: existing.id, name: existing.name, repos: (existing.repos || []).map((r) => ({ ...r })), llm: { ...(existing.llm || {}) }, mode: existing.mode || 'strict', allowed_hosts: [...(existing.allowed_hosts || [])] }
-    : { id: null, name: '', repos: [], llm: { engine: 'none', base_url: '', model: '', embedding_model: '', api_key: '', num_ctx: 8192 }, mode: 'strict', allowed_hosts: [] };
+    : { id: null, name: '', repos: [], llm: { engine: 'none', base_url: '', model: '', embedding_model: '', api_key: '', num_ctx: 8192, think: false }, mode: 'strict', allowed_hosts: [] };
 
   let step = Math.max(0, Math.min(3, Number(route.query.step) || 0));
   let panel = null; // composant courant possédant un destroy()

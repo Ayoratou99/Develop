@@ -175,11 +175,13 @@ def create_app(settings_override: Optional[GlobalSettings] = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         task = asyncio.create_task(state.refresh_model_info(MODEL_INFO_TIMEOUT_S))
+        warm_task = asyncio.create_task(state.warm_models())  # préchauffage en arrière-plan, jamais bloquant
         try:
             yield
         finally:
-            if not task.done():
-                task.cancel()
+            for t in (task, warm_task):
+                if not t.done():
+                    t.cancel()
             await state.aclose()
 
     app = FastAPI(title="Develop", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None,

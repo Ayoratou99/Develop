@@ -6,6 +6,7 @@ from develop.document_indexer.chunking import (  # noqa: F401
     chunk_mode_for,
     chunk_text,
     estimate_tokens,
+    numbered_heading,
 )
 from develop.document_indexer.loaders import (  # noqa: F401
     PAGE_SEPARATOR,
@@ -20,4 +21,5 @@ from develop.document_indexer.loaders import (  # noqa: F401
     looks_like_data_dictionary,
     markdown_headings,
     page_for_offset,
+    strip_page_furniture,
 )

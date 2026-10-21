@@ -758,6 +758,137 @@ def test_migration_without_closure_body_warns_but_keeps_model():
     assert any("Schema::create" in w for w in fa.warnings)
 
 
+DYNAMIC_TABLE_MIGRATION_SRC = r"""
+<?php
+use Illuminate\Database\Migrations\Migration;
+
+return new class extends Migration
+{
+    private const TABLES = ['form_fields', 'shared_widget_fields'];
+    private const COLUMNS = ['journal' => 'detail', 'audit' => 'trace'];
+    protected $extra = ['notes'];
+
+    public function up(): void
+    {
+        foreach (self::TABLES as $table) {
+            if (!Schema::hasTable($table) || Schema::hasColumn($table, 'columns')) {
+                continue;
+            }
+            Schema::table($table, function (Blueprint $t) {
+                $t->json('columns')->nullable()->after('search_fields');
+            });
+        }
+        foreach (self::COLUMNS as $table => $column) {
+            Schema::table($table, function (Blueprint $t) use ($column) {
+                $t->text('payload');
+            });
+        }
+        foreach ($this->extra as $i => $tbl) {
+            Schema::table($tbl, function (Blueprint $t) {
+                $t->string('title');
+            });
+        }
+        $names = ['logs', 'audits'];
+        foreach ($names as $n) {
+            Schema::create($n, function (Blueprint $t) {
+                $t->id();
+            });
+        }
+        Schema::table($this->resolveTable(), function (Blueprint $t) {
+            $t->string('ghost');
+        });
+    }
+};
+"""
+
+
+def test_migration_dynamic_table_name_resolved_from_enclosing_foreach():
+    """``Schema::table($table, ...)`` dans un ``foreach`` : le nom vient de la collection itérée (constante de
+    classe, propriété, tableau littéral, variable), jamais d'un littéral du corps de la closure (défaut réel :
+    modèles fantômes « columns » / « auto_filtre »). Un nom irrésoluble donne un avertissement, pas un modèle."""
+    fa = analyze(DYNAMIC_TABLE_MIGRATION_SRC, "database/migrations/2026_07_02_130000_add_columns.php")
+    assert [(m.name, m.table_name, m.meta.get("operation")) for m in fa.models] == [
+        ("form_fields", "form_fields", "table"),
+        ("shared_widget_fields", "shared_widget_fields", "table"),
+        ("journal", "journal", "table"),
+        ("audit", "audit", "table"),
+        ("notes", "notes", "table"),
+        ("logs", "logs", "create"),
+        ("audits", "audits", "create"),
+    ]
+    form, widget, journal, audit, notes, logs, audits = fa.models
+    assert form.line == widget.line == 16
+    assert fields(form) == fields(widget) == [("columns", "json", True, None)]
+    assert form.meta == widget.meta == {"operation": "table", "alter": True}
+    assert fields(journal) == fields(audit) == [("payload", "text", False, None)]
+    assert fields(notes) == [("title", "string", False, None)]
+    assert fields(logs) == fields(audits) == [("id", "id", False, None)]
+    assert "ghost" not in {f.name for m in fa.models for f in m.fields}
+    assert fa.warnings == ["migration : nom de table dynamique non résolu pour Schema::table (ligne 36)"]
+
+
+def test_migration_down_method_is_ignored():
+    """Les ``Schema::`` de ``down()`` défont ``up()`` : ils ne produisent ni modèle en double ni ligne vide
+    (défaut réel : 64 fichiers de migration sur 120 avec une 2e ligne ``fields=[]``)."""
+    fa = analyze(r"""
+    <?php
+    return new class extends Migration
+    {
+        public function up(): void
+        {
+            Schema::table('villes', function (Blueprint $table) {
+                $table->uuid('region_id');
+            });
+            Schema::table('fichiers', function (Blueprint $table) {
+                $table->string('local_path', 500)->nullable();
+            });
+        }
+
+        public function down(): void
+        {
+            Schema::table('villes', function (Blueprint $table) {
+                $table->dropColumn('region_id');
+            });
+            Schema::table('fichiers', fn (Blueprint $t) => $t->dropColumn('local_path'));
+            Schema::create('archive', function (Blueprint $table) {
+                $table->id();
+            });
+        }
+    };
+    """)
+    assert fa.warnings == []
+    assert [(m.name, m.line) for m in fa.models] == [("villes", 6), ("fichiers", 9)]
+    villes, fichiers = fa.models
+    assert fields(villes) == [("region_id", "uuid", False, None)]
+    assert fields(fichiers) == [("local_path", "string", True, None)]
+    assert "dropped" not in villes.meta and "dropped" not in fichiers.meta
+
+
+def test_migration_arrow_closure_and_body_outside_call():
+    """Closure fléchée ``fn (Blueprint $t) => ...`` acceptée ; un appel sans closure ne doit pas s'approprier
+    l'accolade de l'appel suivant (sinon ``b`` recevait les colonnes de ``c``)."""
+    fa = analyze(r"""
+    <?php
+    return new class extends Migration
+    {
+        public function up(): void
+        {
+            Schema::table('a', fn (Blueprint $t) => $t->dropColumn('legacy'));
+            Schema::table('b', $this->callback());
+            Schema::table('c', function (Blueprint $t) {
+                $t->string('z');
+            });
+        }
+    };
+    """)
+    assert [(m.name, m.line) for m in fa.models] == [("a", 6), ("b", 7), ("c", 8)]
+    a, b, c = fa.models
+    assert a.fields == [] and a.meta["dropped"] == ["legacy"]
+    assert b.fields == [] and "dropped" not in b.meta
+    assert fields(c) == [("z", "string", False, None)]
+    assert fa.warnings == ["migration b : corps de Schema::table introuvable (ligne 7)"]
+
+
 # --------------------------------------------------------------------------- routes Laravel
 
 
@@ -944,12 +1075,12 @@ def test_client_calls_http_facade_guzzle_curl_and_file_get_contents():
     assert fa.warnings == []
     assert sorted(eps(fa), key=lambda e: e[5]) == [
         ("client", "POST", "http://localhost:3001/notifications", "Notifier@send", "laravel-http", 13),
-        ("client", "GET", "{$this->base}/users/$id", "Notifier@send", "laravel-http", 14),
-        ("client", "PUT", "/items/$id", "Notifier@send", "laravel-http", 15),
+        ("client", "GET", "{base}/users/{id}", "Notifier@send", "laravel-http", 14),
+        ("client", "PUT", "/items/{id}", "Notifier@send", "laravel-http", 15),
         ("client", "DELETE", "https://api.example.com/items/1", "Notifier@send", "laravel-http", 16),
         ("client", "GET", "https://api.example.com/users", "Notifier@send", "guzzle", 18),
         ("client", "POST", "/v1/orders", "Notifier@send", "guzzle", 19),
-        ("client", "DELETE", "/orders/{$id}", "Notifier@send", "guzzle", 20),
+        ("client", "DELETE", "/orders/{id}", "Notifier@send", "guzzle", 20),
         ("client", "POST", "https://api.example.com/ping", "Notifier@send", "curl", 21),
         ("client", "GET", "https://api.example.com/feed.json", "Notifier@send", "file_get_contents", 23),
         ("client", "PUT", "https://api.example.com/export", "Notifier@fetchViaCurl", "curl", 31),
@@ -964,6 +1095,64 @@ def test_client_calls_http_facade_guzzle_curl_and_file_get_contents():
     assert by_line[20].meta == {"client": "$this->http"}
     assert by_line[20].normalized_path == "/orders/:param"
     assert all(e.side == "client" for e in fa.endpoints)
+
+
+DYNAMIC_CLIENT_SRC = r'''
+<?php
+namespace App\Services;
+
+use Illuminate\Support\Facades\Http;
+
+class PartnerBPushService
+{
+    const PARTNER_URL = 'https://example.org/partner.json';
+
+    public function login(string $url, string $endpoint, int $id): void
+    {
+        Http::post($url, ['a' => 1]);
+        Http::withHeaders([])->post("{$this->baseUrl}{$endpoint}", []);
+        Http::get(self::PARTNER_URL);
+        $this->client->get("documents/{$id}/");
+        $this->client->delete("documents/{$id}/download/");
+        Http::get("{$this->baseUrl}/api/{$endpoint}");
+        Http::put($this->base . '/items/' . $this->order->id);
+    }
+}
+'''
+
+
+def test_client_calls_drop_variable_only_urls_and_name_php_variables_as_params():
+    """Un appel dont l'URL n'est qu'une variable ou une expression (``Http::post($url)``,
+    ``"{$this->baseUrl}{$endpoint}"``, ``self::PARTNER_URL``) ne désigne aucune route : il n'est pas indexé
+    (sur un projet réel, « POST $url » était classé 5e pour « quel est l'api d'authentification »). Une URL
+    qui garde une partie littérale est conservée, ses variables PHP devenant des paramètres nommés
+    (``documents/{$id}/`` → ``documents/{id}/``, ``$this->order->id`` → ``{id}``) : plus aucun « $ » dans
+    un chemin. Même règle pour les vues Blade : ``fetch(url)`` et ``fetch(`${base}`)`` sont ignorés."""
+    fa = analyze(DYNAMIC_CLIENT_SRC)
+    assert fa.warnings == []
+    assert sorted(eps(fa), key=lambda e: e[5]) == [
+        ("client", "GET", "documents/{id}/", "PartnerBPushService@login", "guzzle", 15),
+        ("client", "DELETE", "documents/{id}/download/", "PartnerBPushService@login", "guzzle", 16),
+        ("client", "GET", "{baseUrl}/api/{endpoint}", "PartnerBPushService@login", "laravel-http", 17),
+        ("client", "PUT", "{base}/items/{id}", "PartnerBPushService@login", "laravel-http", 18),
+    ]
+    assert not any("$" in e.path for e in fa.endpoints)
+    by_line = {e.line: e for e in fa.endpoints}
+    assert by_line[15].normalized_path == "/documents/:param" and by_line[16].normalized_path == "/documents/:param/download"
+    assert by_line[17].normalized_path == "/api/:param" and by_line[18].normalized_path == "/items/:param"
+    assert by_line[18].meta == {"base": "$this->base"}  # la base reste connue par les métadonnées
+    fb = analyze(r'''
+<html>
+<script>
+    function api(url) { return fetch(url); }
+    function load() { axios.get(baseUrl + '/stats'); fetch(`${base}`); fetch('/partner-a/login', { method: 'POST' }); }
+</script>
+</html>
+''', "resources/views/x.blade.php")
+    assert eps(fb) == [
+        ("client", "GET", "{baseUrl}/stats", "load", "axios", 4),
+        ("client", "POST", "/partner-a/login", "load", "fetch", 4),
+    ]
 
 
 # --------------------------------------------------------------------------- vues Blade

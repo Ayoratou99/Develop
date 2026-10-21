@@ -8,6 +8,21 @@ Le LLM ne lit jamais tout le projet. Pour chaque question, Develop calcule :
   comprises), question, historique de conversation, contexte récupéré (code, documents, notes),
   résultats d'outils et réserve pour la réponse.
 
+Répartition (le contexte récupéré est la part qui fait la qualité des réponses, elle est servie
+en premier) :
+
+- consignes système = tokens estimés du vrai gabarit (:func:`develop.chat.prompts.build_system_prompt`)
+  + 10 % de marge, plafonnés à :data:`SYSTEM_TOKENS_CAP` ; en mode natif s'ajoutent les définitions
+  d'outils, réellement envoyées à chaque appel ;
+- historique ≤ 10 % de ``num_ctx``, entre :data:`MIN_HISTORY_TOKENS` et :data:`MAX_HISTORY_TOKENS` ;
+- réserve de réponse = 20 % de ``num_ctx``, entre :data:`MIN_ANSWER_RESERVE` et
+  :data:`MAX_ANSWER_RESERVE` (une réponse citée tient en 3k tokens ; le modèle peut être relancé) ;
+- contexte récupéré = 80 % de ce qui reste (90 % pour une analyse d'impact ou une question large),
+  le solde allant aux résultats d'outils ; sans outils, tout le reste va au contexte.
+
+Repères (mode natif, question factuelle) : ≈ 3,3k tokens de contexte à ``num_ctx`` 8192, ≈ 8k à
+16384, ≈ 20k à 32768.
+
 Invariant : ``system_tokens + question_tokens + history_tokens_max + context_tokens_max +
 tools_tokens_max + answer_reserve <= num_ctx``. Si les consignes avec outils ne laissent pas de
 place à au moins un résultat d'outil, les outils sont désactivés (``tools_mode = "none"``) et
@@ -26,31 +41,33 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 DEFAULT_CONTEXT_LENGTH = 8192  # fenêtre supposée quand le moteur ne la communique pas
 MIN_NUM_CTX = 2048
-MIN_ANSWER_RESERVE = 1024
-MAX_ANSWER_RESERVE = 6000
-ANSWER_SHARE = 0.30
-HISTORY_SHARE = 0.12
-MIN_HISTORY_TOKENS = 1024
+ANSWER_SHARE = 0.20  # réserve de réponse : 20 % de num_ctx…
+MIN_ANSWER_RESERVE = 1024  # … jamais moins (une réponse citée tient rarement en moins)…
+MAX_ANSWER_RESERVE = 3072  # … jamais plus (au-delà, la fenêtre sert mieux au contexte ; le modèle peut être relancé)
+HISTORY_SHARE = 0.10  # historique : 10 % de num_ctx…
+MIN_HISTORY_TOKENS = 768  # … au moins deux tours courts…
+MAX_HISTORY_TOKENS = 2048  # … au plus 2k (le résumé en une ligne couvre le reste)
 MIN_CONTEXT_TOKENS = 256  # plancher des plafonds (max_context_chars, demande de l'UI), jamais de la partition
 CONTEXT_FIRST_TOKENS = 1024  # le contexte récupéré prend jusqu'à 1024 tokens avant de partager avec les outils
 MIN_TOOL_BUDGET = 200  # en dessous, un résultat d'outil ne vaut pas son coût : outil non exécuté / outils désactivés
 DEFAULT_TOOL_ROUNDS = 4
-SYSTEM_MARGIN_TOKENS = 64  # marge de l'estimation des consignes (nom du projet, liste des dépôts, tokenizer réel)
+SYSTEM_MARGIN_SHARE = 0.10  # marge de l'estimation des consignes (nom du projet, liste des dépôts, tokenizer réel)
+SYSTEM_TOKENS_CAP = 1500  # plafond des consignes textuelles estimées (hors définitions d'outils natifs)
 TOOL_SPEC_OVERHEAD_TOKENS = 4  # cadre ajouté par le gabarit du moteur autour de chaque définition d'outil
 TOOLS_MODES = ("native", "text", "none")
 
 # Part du « reste » (après système, question, historique et réserve de réponse) consacrée au
-# contexte récupéré, selon le type de question. Le reste sert aux résultats d'outils.
+# contexte récupéré, selon le type de question. Le solde sert aux résultats d'outils.
 INTENT_SHARES = {
-    "factual": 0.35,
-    "fields": 0.35,
-    "howto": 0.35,
-    "who_calls": 0.40,
-    "impact": 0.50,
-    "decision": 0.35,
-    "broad": 0.45,
+    "factual": 0.80,
+    "fields": 0.80,
+    "howto": 0.80,
+    "who_calls": 0.85,
+    "impact": 0.90,
+    "decision": 0.80,
+    "broad": 0.90,
 }
-DEFAULT_SHARE = 0.35
+DEFAULT_SHARE = 0.80
 
 # Plafond de num_ctx selon la RAM totale (Go) : (borne exclusive, plafond).
 RAM_CAPS = ((8, 4096), (16, 8192), (32, 16384), (64, 32768))
@@ -86,18 +103,34 @@ def tool_specs_tokens(tool_specs: Optional[Sequence[Any]] = None) -> int:
     return estimate_tokens(json.dumps(payload, ensure_ascii=False, default=str)) + TOOL_SPEC_OVERHEAD_TOKENS * len(payload)
 
 
-def system_prompt_tokens(tools_mode: str, num_ctx: int = DEFAULT_CONTEXT_LENGTH, tool_rounds: int = DEFAULT_TOOL_ROUNDS,
-                         workspace_name: str = "", repos_summary: str = "", today: str = "") -> int:
-    """Coût estimé des consignes système pour un mode d'outils, définitions natives comprises.
+def system_text_tokens(tools_mode: str, num_ctx: int = DEFAULT_CONTEXT_LENGTH, tool_rounds: int = DEFAULT_TOOL_ROUNDS,
+                       workspace_name: str = "", repos_summary: str = "", today: str = "") -> int:
+    """Coût estimé des consignes textuelles seules : vrai gabarit + :data:`SYSTEM_MARGIN_SHARE`, ≤ :data:`SYSTEM_TOKENS_CAP`.
 
-    Mesuré sur le vrai gabarit (:func:`develop.chat.prompts.build_system_prompt`) plus une marge
-    pour les parties variables (nom du projet, dépôts) quand elles ne sont pas fournies.
+    La marge couvre les parties variables (nom du projet, dépôts) quand elles ne sont pas fournies
+    et l'écart entre l'estimateur et le tokenizer réel. Les définitions d'outils natifs ne sont pas
+    comprises (voir :func:`system_prompt_tokens`).
     """
     from develop.chat.prompts import build_system_prompt  # import paresseux (prompts → tools → budget)
     mode = tools_mode if tools_mode in TOOLS_MODES else "none"
     shape = SimpleNamespace(num_ctx=int(num_ctx or 0), tool_rounds_max=int(tool_rounds or DEFAULT_TOOL_ROUNDS))
     text = build_system_prompt(mode, shape, workspace_name, repos_summary, today or "2026-01-01")
-    tokens = estimate_tokens(text) + SYSTEM_MARGIN_TOKENS
+    tokens = estimate_tokens(text)
+    # marge arrondie par excès en arithmétique entière : 890 × 1,1 vaut 979,0000000001 en flottant, ce qui ferait
+    # un token de plus avec math.ceil (et une estimation qui dépend du bruit du flottant)
+    margin = (tokens * int(SYSTEM_MARGIN_SHARE * 100) + 99) // 100
+    return min(SYSTEM_TOKENS_CAP, tokens + margin)
+
+
+def system_prompt_tokens(tools_mode: str, num_ctx: int = DEFAULT_CONTEXT_LENGTH, tool_rounds: int = DEFAULT_TOOL_ROUNDS,
+                         workspace_name: str = "", repos_summary: str = "", today: str = "") -> int:
+    """Coût estimé des consignes système pour un mode d'outils, définitions natives comprises.
+
+    = :func:`system_text_tokens` (gabarit mesuré + 10 % de marge, plafonné) + :func:`tool_specs_tokens`
+    en mode ``native`` (les définitions sont réellement envoyées, elles ne sont jamais plafonnées).
+    """
+    mode = tools_mode if tools_mode in TOOLS_MODES else "none"
+    tokens = system_text_tokens(mode, num_ctx, tool_rounds, workspace_name, repos_summary, today)
     if mode == "native":
         tokens += tool_specs_tokens()
     return tokens
@@ -163,6 +196,16 @@ def intent_share(intent: Optional[str]) -> float:
     return INTENT_SHARES.get((intent or "").strip().lower(), DEFAULT_SHARE)
 
 
+def answer_reserve_for(num_ctx: int) -> int:
+    """Réserve de réponse : :data:`ANSWER_SHARE` de ``num_ctx`` entre :data:`MIN_ANSWER_RESERVE` et :data:`MAX_ANSWER_RESERVE`."""
+    return max(MIN_ANSWER_RESERVE, min(MAX_ANSWER_RESERVE, int(num_ctx * ANSWER_SHARE)))
+
+
+def history_tokens_for(num_ctx: int) -> int:
+    """Historique : :data:`HISTORY_SHARE` de ``num_ctx`` entre :data:`MIN_HISTORY_TOKENS` et :data:`MAX_HISTORY_TOKENS`."""
+    return min(MAX_HISTORY_TOKENS, max(MIN_HISTORY_TOKENS, int(num_ctx * HISTORY_SHARE)))
+
+
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(value or 0)
@@ -215,7 +258,9 @@ def _split(num_ctx: int, system: int, question: int, answer: int, history_defaul
     """Répartit ce qui reste après système, question et réponse ; renvoie (historique, reste, contexte, outils).
 
     L'historique cède en premier sur une petite fenêtre : il garde au plus la moitié de ce qui
-    reste au-delà de :data:`MIN_CONTEXT_TOKENS`. Sans outils, tout le reste va au contexte.
+    reste au-delà de :data:`MIN_CONTEXT_TOKENS`. Sans outils, tout le reste va au contexte ; avec
+    outils, le contexte prend ``share`` du reste (et jamais moins que :data:`CONTEXT_FIRST_TOKENS`
+    si le reste le permet), le solde allant aux résultats d'outils.
     """
     free = num_ctx - system - question - answer
     history = min(history_default, max(0, free - MIN_CONTEXT_TOKENS) // 2)
@@ -237,11 +282,12 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
 
     ``tools_mode`` est le mode d'outils souhaité (``native``, ``text`` ou ``none``) ;
     ``system_tokens`` le coût mesuré des consignes système dans ce mode (définitions d'outils
-    natifs comprises), sinon il est estimé sur les gabarits ; ``question_tokens`` le coût de la
-    question de l'utilisateur. Si les outils ne laisseraient pas :data:`MIN_TOOL_BUDGET` tokens à
-    leurs résultats, le budget revient en mode ``none`` (``tool_rounds_max = 0``) et le dit dans
-    ``source`` ; un ``system_tokens`` fourni pour un mode avec outils est alors remplacé par
-    l'estimation sans outils (l'appelant remesure s'il veut l'exactitude).
+    natifs comprises), utilisé tel quel, sinon il est estimé sur les gabarits avec 10 % de marge
+    (:func:`system_prompt_tokens`) ; ``question_tokens`` le coût de la question de l'utilisateur.
+    Si les outils ne laisseraient pas :data:`MIN_TOOL_BUDGET` tokens à leurs résultats, le budget
+    revient en mode ``none`` (``tool_rounds_max = 0``) et le dit dans ``source`` ; un
+    ``system_tokens`` fourni pour un mode avec outils est alors remplacé par l'estimation sans
+    outils (l'appelant remesure s'il veut l'exactitude).
     """
     num_ctx, parts = effective_num_ctx(cfg, model_info, profile)
     rounds = DEFAULT_TOOL_ROUNDS
@@ -250,11 +296,13 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
     share = intent_share(intent)
 
     # ----- parts fixes -----
-    answer_reserve = max(MIN_ANSWER_RESERVE, min(MAX_ANSWER_RESERVE, int(num_ctx * ANSWER_SHARE)))
-    history_default = min(max(MIN_HISTORY_TOKENS, int(num_ctx * HISTORY_SHARE)), num_ctx // 4)
+    answer_reserve = answer_reserve_for(num_ctx)
+    history_default = history_tokens_for(num_ctx)
     measured = system_tokens is not None and _as_int(system_tokens) >= 0
     system = _as_int(system_tokens) if measured else system_prompt_tokens(mode, num_ctx, rounds)
-    system_desc = "mesurées" if measured else "estimées"
+    system_desc = "mesurées" if measured else "estimées, gabarit + %d %% de marge" % int(SYSTEM_MARGIN_SHARE * 100)
+    if mode == "native":
+        system_desc += ", définitions d'outils natifs comprises"
 
     # ----- répartition, avec repli sans outils si la fenêtre ne les porte pas -----
     history, remaining, context, tools = _split(num_ctx, system, question, answer_reserve, history_default, share,
@@ -265,7 +313,7 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
                       % (system, tools))
         mode = "none"
         system = system_prompt_tokens(mode, num_ctx, 0)
-        system_desc = "estimées"
+        system_desc = "estimées, gabarit + %d %% de marge" % int(SYSTEM_MARGIN_SHARE * 100)
         history, remaining, context, tools = _split(num_ctx, system, question, answer_reserve, history_default, share,
                                                     False)
     if mode == "none":
@@ -274,7 +322,7 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
     if mode == "none":
         context_desc = "contexte ≤ %d (tout le reste)" % context
     else:
-        context_desc = "contexte ≤ %d (%s : %d %% du reste %d)" % (context, intent or "factual", int(share * 100), remaining)
+        context_desc = "contexte ≤ %d (%s : %d %% du reste)" % (context, intent or "factual", int(share * 100))
 
     max_chars = _as_int(getattr(cfg, "max_context_chars", 0))
     if max_chars > 0:
@@ -292,9 +340,13 @@ def compute_budget(cfg: Any, model_info: Any = None, profile: Any = None, intent
 
     if num_ctx - system - question - answer_reserve < 0:
         parts.append("question trop longue pour la fenêtre : le moteur tronquera")
-    source = ("num_ctx %d = min(%s) ; système %d (%s, mode %s), question %d, historique ≤ %d, %s, outils ≤ %d, "
-              "réponse %d, %d tours d'outils max" % (num_ctx, ", ".join(parts), system, system_desc, mode, question,
-                                                     history, context_desc, tools, answer_reserve, rounds))
+    source = ("num_ctx %d = min(%s) ; système %d (%s, mode %s), question %d, "
+              "historique ≤ %d (%d %% de num_ctx, entre %d et %d), réponse %d (%d %% de num_ctx, entre %d et %d), "
+              "reste %d : %s, outils ≤ %d, %d tours d'outils max"
+              % (num_ctx, ", ".join(parts), system, system_desc, mode, question,
+                 history, int(HISTORY_SHARE * 100), MIN_HISTORY_TOKENS, MAX_HISTORY_TOKENS,
+                 answer_reserve, int(ANSWER_SHARE * 100), MIN_ANSWER_RESERVE, MAX_ANSWER_RESERVE,
+                 remaining, context_desc, tools, rounds))
     if downgraded:
         source += " ; " + downgraded
     return Budget(num_ctx=num_ctx, system_tokens=system, history_tokens_max=history, context_tokens_max=context,

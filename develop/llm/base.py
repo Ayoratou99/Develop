@@ -134,6 +134,14 @@ class LLMClient:
     async def embed(self, texts: Sequence[str], model: str) -> List[List[float]]:
         raise NotImplementedError
 
+    async def loaded_models(self) -> List[str]:
+        """Modèles actuellement chargés en mémoire par le moteur (vide si le moteur ne le dit pas)."""
+        return []
+
+    async def warm(self, model: str) -> bool:
+        """Précharge un modèle en mémoire pour éviter l'attente au premier message (False si non supporté)."""
+        return False
+
     async def aclose(self) -> None:
         return None
 

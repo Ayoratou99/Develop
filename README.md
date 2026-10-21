@@ -22,8 +22,9 @@ connaître les champs de tel modèle. Develop répond à ces questions en citant
 Le modèle ne lit jamais le projet. Develop garde une mémoire persistante (SQLite) et, à chaque question :
 
 1. analyse la question (identifiants, routes, tables, intention, dates) ;
-2. cherche sur cinq canaux : identifiants exacts, recherche lexicale (FTS5), recherche sémantique (embeddings locaux,
-   si un modèle est configuré), graphe de relations (un saut), notes par date ;
+2. cherche sur six canaux : identifiants exacts, routes (vocabulaire de la question rapproché des chemins et des
+   contrôleurs : « authentification » → `login`, `AuthController`), recherche lexicale (FTS5), recherche sémantique
+   (embeddings locaux, si un modèle est configuré), graphe de relations (un saut), notes par date ;
 3. fusionne les résultats (Reciprocal Rank Fusion), déduplique, diversifie ;
 4. calcule un **budget de contexte** à partir de la fenêtre réelle du modèle et de la RAM de la machine, puis remplit
    ce budget avec les meilleurs passages, chacun identifié `[S1]`, `[S2]`… ;
@@ -156,6 +157,20 @@ Conseils :
 - Pour une question factuelle, le mode **Sans outils** (`develop ask --no-tools`) répond en un seul tour.
 - Pour l'usage quotidien sur un portable, préférez un modèle de 8 à 14 milliards de paramètres (`develop doctor` en
   propose avec leur vitesse estimée) et gardez le 27B pour les analyses d'impact complexes.
+
+### Pourquoi « Recherche dans le projet… » semblait long
+
+Mesure du 2026-10-21 sur un index de 5 910 morceaux : la recherche elle-même (identifiants, lexical, route, sémantique,
+graphe, fiches) tient en moins de 100 ms. Le temps perçu venait d'ailleurs :
+
+| Cause | Durée mesurée | Correctif |
+|---|---|---|
+| Ollama déchargeait le modèle de chat après 5 min d'inactivité, rechargé à la question suivante | 28 s (modèle de 19 Go) | `keep_alive` 30 min sur chaque appel, préchauffage au démarrage de `develop serve` |
+| Premier chargement de l'embedder avec une fenêtre de 40k tokens | 2 s et 4,8 Go de mémoire | fenêtre d'embedding limitée à 4 096 tokens (0,8 Go), `keep_alive` 30 min |
+| Lecture du contexte par le modèle (préremplissage de 4 à 8k tokens) affichée sous « Recherche… » | 15 à 40 s selon le modèle | états « Chargement du modèle… » et « Le modèle lit N sources (≈ X tokens)… » avec compteur de secondes |
+
+Le préremplissage reste proportionnel à la taille du modèle : un 8 à 14B lit le même contexte deux à trois fois plus
+vite qu'un 27B.
 
 ## Garanties
 

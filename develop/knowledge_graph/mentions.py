@@ -296,6 +296,9 @@ class NameIndex:
     #: Noms (minuscules) des modèles qui sont des classes métier (Eloquent, JPA, interface TS…), par
     #: opposition aux définitions de table (:data:`TABLE_DEFINITION_KINDS`).
     entity_models: Set[str] = field(default_factory=set)
+    #: Identifiants des modèles qui ne font que définir une table (migrations, DDL) : un mot ordinaire
+    #: qui nomme la table désigne la table, pas chacune des migrations qui la touchent.
+    definition_models: Set[int] = field(default_factory=set)
 
     @classmethod
     def build(cls, db: Database) -> "NameIndex":
@@ -328,6 +331,8 @@ class NameIndex:
             idx.models.setdefault(name.lower(), []).append((mid, fid, name))
             if (r["kind"] or "") not in TABLE_DEFINITION_KINDS:
                 idx.entity_models.add(name.lower())
+            else:
+                idx.definition_models.add(mid)
             idx._learn_words(name)
             table = (r["table_name"] or "").strip().strip("`\"'[]")
             if table:

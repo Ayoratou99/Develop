@@ -2,8 +2,9 @@
 
 Couvre : namespace, classes / interfaces / traits / enums, fonctions, méthodes, propriétés,
 constantes ; modèles Eloquent ; migrations (``Schema::create`` / ``Schema::table``) ; routes
-Laravel (``Route::``) ; appels HTTP sortants (``Http::``, Guzzle, curl, ``file_get_contents``) ;
-imports ``use`` / ``require``. Pour les vues Blade (``*.blade.php``), seuls les appels
+Laravel (``Route::``) ; appels HTTP sortants (``Http::``, Guzzle, curl, ``file_get_contents`` ; les
+variables PHP du chemin deviennent des paramètres nommés, ``documents/{$id}/`` → ``documents/{id}/``, et un
+chemin qui n'est qu'une variable, ``Http::post($url)``, n'est pas indexé) ; imports ``use`` / ``require``. Pour les vues Blade (``*.blade.php``), seuls les appels
 ``route()`` / ``url()`` / ``axios`` / ``fetch`` des blocs ``<script>`` sont extraits.
 
 Principe : le source est d'abord « masqué » en deux variantes de même longueur que l'original
@@ -14,6 +15,7 @@ littérales sur ``noc``. Tous les motifs sont bornés (pas de ``.*`` gourmand su
 """
 from __future__ import annotations
 
+import copy
 import re
 from bisect import bisect_left, bisect_right
 from typing import Any, Dict, List, Optional, Tuple
@@ -870,7 +872,15 @@ class _ModelMixin:
 _SCHEMA_RE = re.compile(
     r"Schema\s*::\s*(?:connection\s*\((?:[^()]|\([^()]*\)){0,2000}\)\s*->\s*)?(create|table)\s*\("
 )
-_BLUEPRINT_PARAM_RE = re.compile(r"function\s*\(\s*(?:[\w\\]+\s+)?\$(\w+)")
+_BLUEPRINT_PARAM_RE = re.compile(r"(?<![\w$])(?:function|fn)\s*\(\s*(?:\??[\w\\]+\s+)?\$(\w+)")
+_ARROW_FN_RE = re.compile(r"(?<![\w$])fn\s*\((?:[^()]|\([^()]*\)){0,500}\)\s*(?::\s*\??[\w\\|]+\s*)?=>")
+_DOWN_RE = re.compile(r"function\s+down\s*\(")
+_FOREACH_RE = re.compile(r"foreach\s*\(")
+_FOREACH_HEAD_RE = re.compile(r"^\s*(.*?)\s+as\s+(?:\$(\w+)\s*=>\s*)?&?\s*\$(\w+)\s*$", re.S)
+_ARG_DELIM_RE = re.compile(r"[()\[\]{},]")
+_CLASS_CONST_REF_RE = re.compile(r"(?:self|static|parent|[\w\\]+)\s*::\s*(\w+)$")
+_THIS_PROP_REF_RE = re.compile(r"\$this\s*->\s*(\w+)$")
+_VAR_REF_RE = re.compile(r"\$(\w+)$")
 _CHAIN_CALL_RE = re.compile(r"\s*->\s*(\w+)\s*\(")
 _INCREMENTS = {"id", "bigIncrements", "increments", "mediumIncrements", "smallIncrements", "tinyIncrements"}
 _DEFAULT_NAME = {"id": "id", "uuid": "uuid", "ulid": "ulid", "ipAddress": "ip_address", "macAddress": "mac_address",
@@ -1051,27 +1061,175 @@ class _MigrationMixin:
         if rel_field and rel_target:
             model.relations.append(ModelRelation(kind="foreign_key", target=rel_target, field=rel_field))
 
+    # ---- résolution du nom de table (premier argument de ``Schema::create`` / ``Schema::table``)
+
+    def _down_spans(self) -> List[Tuple[int, int]]:
+        """Bornes des corps de ``down()`` : ils défont ``up()`` et ne décrivent pas le schéma résultant."""
+        src, code = self.src, self.src.code
+        spans: List[Tuple[int, int]] = []
+        for dm in _DOWN_RE.finditer(code):
+            if not _bounded(code, dm.start()):
+                continue
+            close = src.match_paren(dm.end() - 1)
+            after = close if close is not None else dm.end()
+            bo = src.next_brace(after, 300)
+            if bo is None or code.find(";", after, bo) >= 0:  # ``function down();`` (abstraite) : pas de corps
+                continue
+            bc = src.close_of(bo)
+            if bc is not None:
+                spans.append((bo, bc))
+        return spans
+
+    def _array_strings(self, start: int, end: int, want_key: bool = False) -> Optional[List[str]]:
+        """Chaînes d'un tableau littéral ``[...]`` / ``array(...)`` (valeurs, ou clés si ``want_key``)."""
+        src, code, noc = self.src, self.src.code, self.src.noc
+        o = code.find("[" if code[start] == "[" else "(", start, end)
+        if o < 0:
+            return None
+        c = src.match_paren(o, "[", "]") if code[o] == "[" else src.match_paren(o)
+        if c is None or c > end:
+            return None
+        out: List[str] = []
+        for ec, er in _split_top(code[o + 1: c], noc[o + 1: c]):
+            k = ec.find("=>")
+            if k >= 0:
+                s = _first_string(er[:k] if want_key else er[k + 2:])
+            else:
+                s = _first_string(er)
+            if s is not None:
+                out.append(s)
+        return out or None
+
+    def _resolve_names(self, start: int, end: int, want_key: bool = False, depth: int = 0) -> Optional[List[str]]:
+        """Chaînes désignées par l'expression ``code[start:end]`` : littéral (chaîne, tableau), constante de
+        classe (``self::TABLES``), propriété (``$this->tables``) ou variable affectée / itérée par un
+        ``foreach`` englobant. ``None`` si l'expression est dynamique (appel, concaténation sans littéral…)."""
+        src, code, noc = self.src, self.src.code, self.src.noc
+        while start < end and code[start].isspace():
+            start += 1
+        while end > start and code[end - 1].isspace():
+            end -= 1
+        if start >= end or depth > 4:
+            return None
+        expr = code[start:end]
+        if expr[0] in "'\"":
+            s = _first_string(noc[start:end])
+            return [s] if s else None
+        if expr[0] == "[" or expr.startswith("array"):
+            return self._array_strings(start, end, want_key)
+        cm = _CLASS_CONST_REF_RE.match(expr)
+        if cm:
+            dm = re.search(r"const\s+(?:[\w\\|?]+\s+)?" + re.escape(cm.group(1)) + r"\s*=", code)
+            if dm and _bounded(code, dm.start()):
+                return self._resolve_names(dm.end(), self._stmt_end(dm.end()), want_key, depth + 1)
+            return None
+        pm = _THIS_PROP_REF_RE.match(expr)
+        if pm:
+            name = re.escape(pm.group(1))
+            dm = re.search(r"(?:public|protected|private|var|static|readonly)\s+(?:\??[\w\\|&]+\s+)?\$" + name
+                           + r"\s*=(?![=>])", code) or re.search(r"\$this\s*->\s*" + name + r"\s*=(?![=>])", code)
+            if dm:
+                return self._resolve_names(dm.end(), self._stmt_end(dm.end()), want_key, depth + 1)
+            return None
+        vm = _VAR_REF_RE.match(expr)
+        if vm:
+            found = self._foreach_values(vm.group(1), start, depth)
+            if found is not None:
+                return found
+            last = None
+            for am in re.compile(r"\$" + re.escape(vm.group(1)) + r"\s*=(?![=>])").finditer(code, 0, start):
+                last = am
+            if last is not None:
+                return self._resolve_names(last.end(), self._stmt_end(last.end()), want_key, depth + 1)
+        return None
+
+    def _stmt_end(self, pos: int) -> int:
+        i = self.src.code.find(";", pos)
+        return i if i >= 0 else len(self.src.code)
+
+    def _foreach_values(self, var: str, before: int, depth: int) -> Optional[List[str]]:
+        """Valeurs itérées par le ``foreach (... as $var)`` le plus interne dont le corps contient ``before``."""
+        src, code = self.src, self.src.code
+        best: Optional[Tuple[int, int, bool]] = None
+        for fm in _FOREACH_RE.finditer(code, 0, before):
+            if not _bounded(code, fm.start()):
+                continue
+            p = fm.end() - 1
+            c = src.match_paren(p)
+            if c is None or c > before:
+                continue
+            bo = src.next_brace(c, 50)
+            bc = src.close_of(bo) if bo is not None else None
+            if bo is None or bc is None or not (bo < before < bc) or code.find(";", c, bo) >= 0:
+                continue
+            hm = _FOREACH_HEAD_RE.match(code[p + 1: c])
+            if not hm:
+                continue
+            if hm.group(3) == var:
+                best = (p + 1 + hm.start(1), p + 1 + hm.end(1), False)
+            elif hm.group(2) == var:
+                best = (p + 1 + hm.start(1), p + 1 + hm.end(1), True)
+        if best is None:
+            return None
+        return self._resolve_names(best[0], best[1], best[2], depth + 1)
+
+    def _schema_tables(self, paren: int, close: Optional[int]) -> Tuple[List[str], int]:
+        """Tables visées par l'appel dont la parenthèse ouvrante est ``paren`` → (noms, fin du 1er argument)."""
+        code = self.src.code
+        if close is None:  # parenthèse jamais fermée : premier littéral dans une fenêtre bornée, comme avant
+            s = _first_string(self.src.noc[paren: paren + 300])
+            return ([s] if s else []), paren + 300
+        first_end = close
+        depth = 0
+        for dm in _ARG_DELIM_RE.finditer(code, paren + 1, close):
+            ch = dm.group()
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif depth == 0:
+                first_end = dm.start()
+                break
+        return (self._resolve_names(paren + 1, first_end) or []), first_end
+
     def extract_migrations(self) -> None:
         src = self.src
         code = src.code
+        down_spans = self._down_spans()
         for m in _SCHEMA_RE.finditer(code):
             if not _bounded(code, m.start()):
                 continue
+            if any(a < m.start() < b for a, b in down_spans):
+                continue
             paren = m.end() - 1
             close = src.match_paren(paren)
-            table = _first_string(src.noc[paren: min(paren + 300, close + 1 if close else paren + 300)])
-            if not table:
+            op = m.group(1)
+            line = src.line(m.start())
+            tables, first_end = self._schema_tables(paren, close)
+            if not tables:
+                self.result.warnings.append("migration : nom de table dynamique non résolu pour Schema::%s (ligne %d)"
+                                            % (op, line))
                 continue
-            model = ExtractedModel(name=table, kind="migration", table_name=table, line=src.line(m.start()),
-                                   meta={"operation": m.group(1)})
-            if m.group(1) == "table":
-                model.meta["alter"] = True
+            models = []
+            for table in tables:
+                model = ExtractedModel(name=table, kind="migration", table_name=table, line=line,
+                                       meta={"operation": op})
+                if op == "table":
+                    model.meta["alter"] = True
+                models.append(model)
+            model = models[0]
             body_open = src.next_brace(paren)
+            if close is not None and body_open is not None and body_open > close:
+                body_open = None  # accolade au-delà de l'appel : pas une closure de cet appel
             body_close = src.close_of(body_open) if body_open is not None else None
+            if body_open is None and close is not None:
+                am = _ARROW_FN_RE.search(code, first_end, close)
+                if am:  # ``fn (Blueprint $t) => $t->...`` : le corps est l'expression jusqu'à la parenthèse fermante
+                    body_open, body_close = am.end() - 1, close
             if body_open is None or body_close is None:
                 self.result.warnings.append("migration %s : corps de Schema::%s introuvable (ligne %d)"
-                                            % (table, m.group(1), model.line))
-                self.result.models.append(model)
+                                            % (model.name, op, line))
+                self.result.models.extend(models)
                 continue
             pm = _BLUEPRINT_PARAM_RE.search(code, paren, body_open + 1)
             var = pm.group(1) if pm else "table"
@@ -1087,7 +1245,11 @@ class _MigrationMixin:
                     if calls:
                         self._column_from_chain(calls, model)
                 start = stmt_end + 1
-            self.result.models.append(model)
+            for extra in models[1:]:  # même closure appliquée à plusieurs tables (``foreach``)
+                extra.fields = copy.deepcopy(model.fields)
+                extra.relations = copy.deepcopy(model.relations)
+                extra.meta = copy.deepcopy(model.meta)
+            self.result.models.extend(models)
 
 
 # --------------------------------------------------------------------------- routes Laravel
@@ -1326,6 +1488,39 @@ _HTTP_VERBS = {"get", "post", "put", "patch", "delete", "head", "options"}
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://[^/]*", re.I)
 _CLIENT_HINT_RE = re.compile(r"client|http|guzzle|api", re.I)
 _URL_HINT_RE = re.compile(r"url|api|base|host|endpoint", re.I)
+# Variables PHP d'un chemin d'appel client (« documents/{$id}/ », « /items/$id », « {$this->base}/users ») : une route
+# s'écrit avec des paramètres nommés (« documents/{id}/ », « {base}/users »), pas avec la syntaxe PHP.
+_PHP_VAR_RE = re.compile(r"\$([A-Za-z_]\w*)((?:->[A-Za-z_]\w*|\[[^\[\]{}]*\])*)")
+_BRACED_VAR_RE = re.compile(r"\{([^{}]*\$[^{}]*)\}")
+_PROP_CHAIN_RE = re.compile(r"->([A-Za-z_]\w*)")
+# Partie dynamique d'un chemin : variable, interpolation ou expression ({$this->baseUrl}, ${id}, {config('x')}, {url}).
+_DYNAMIC_PART_RE = re.compile(r"\$\{[^{}]*\}|\$[A-Za-z_]\w*|\{[^{}]*\}")
+
+
+def _only_dynamic(path: str) -> bool:
+    """Vrai si le chemin n'est fait que de variables ou d'expressions (``$url``, ``{$this->baseUrl}{$endpoint}``,
+    ``{self::PARTNER_URL}``, ``fetch(url)`` → ``{url}``) : il ne désigne aucune route, il n'est pas indexé."""
+    s, prev = path, None
+    while s != prev:
+        prev, s = s, _DYNAMIC_PART_RE.sub("", s)
+    return not s.strip()
+
+
+def _var_placeholder(expr: str) -> Optional[str]:
+    """Nom de paramètre d'une expression PHP : ``$id`` → ``id``, ``$this->baseUrl`` → ``baseUrl``, ``$ids[0]`` → ``ids``."""
+    m = _PHP_VAR_RE.search(expr)
+    if m is None:
+        return None
+    props = _PROP_CHAIN_RE.findall(m.group(2))
+    return props[-1] if props else m.group(1)
+
+
+def _php_placeholders(path: str) -> str:
+    """Remplace chaque variable PHP d'un chemin par un paramètre nommé : ``documents/{$id}/`` → ``documents/{id}/``,
+    ``/items/$id`` → ``/items/{id}``, ``{$this->base}/users`` → ``{base}/users`` ; une expression sans variable
+    (``{config('services.api.url')}``) est conservée telle quelle."""
+    path = _BRACED_VAR_RE.sub(lambda m: "{%s}" % (_var_placeholder(m.group(1)) or m.group(1)), path)
+    return _PHP_VAR_RE.sub(lambda m: "{%s}" % (_var_placeholder(m.group(0)) or m.group(1)), path)
 
 
 def _url_expr(code_arg: str, raw_arg: str) -> Tuple[str, Optional[str], bool]:
@@ -1369,8 +1564,9 @@ class _ClientMixin:
     def _add_client(self, method: str, code_arg: str, raw_arg: str, framework: str, off: int,
                     extra: Optional[Dict[str, Any]] = None) -> None:
         path, base, _ = _url_expr(code_arg, raw_arg)
-        if not path:
-            return
+        if not path or _only_dynamic(path):
+            return  # « Http::post($url) » : aucune route désignée
+        path = _php_placeholders(path)
         meta: Dict[str, Any] = dict(extra or {})
         if base:
             meta["base"] = base
@@ -1633,8 +1829,8 @@ def _analyze_blade(text: str, path: str) -> FileAnalysis:
                 framework = "jquery"
                 p, meta = _js_arg_path(args[0][1], args[0][0])
                 method = cm.group(4).upper()
-            if not p:
-                continue
+            if not p or _only_dynamic(p):
+                continue  # « fetch(url) » : aucune route désignée
             off = base_off + cm.start()
             fa.endpoints.append(ExtractedEndpoint(side="client", method=method, path=p, handler=handler_at(cm.start()),
                                                   framework=framework, line=bisect_right(starts, off), meta=meta))

@@ -27,6 +27,9 @@ RepoKind = Literal["frontend", "backend", "docs", "database", "mobile", "shared"
 EngineKind = Literal["none", "ollama", "openai_compat"]
 NetworkMode = Literal["strict", "local_network"]
 
+DEFAULT_MAX_CONTEXT_CHARS = 96_000  # ≈ 24k tokens : ne bride le budget de contexte qu'au-delà de 32k de fenêtre
+LEGACY_MAX_CONTEXT_CHARS = 24_000  # ancien défaut (≈ 6k tokens), remplacé par DEFAULT_MAX_CONTEXT_CHARS à la lecture
+
 
 class RepoConfig(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -50,8 +53,15 @@ class LLMConfig(BaseModel):
     temperature: float = 0.2
     num_ctx: int = 8192  # fenêtre de contexte demandée au moteur
     think: bool = False  # réflexion interne (« thinking ») des modèles qui la supportent : plus précis mais bien plus lent
-    max_context_chars: int = 24_000  # budget de contexte RAG injecté dans le prompt
+    max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS  # plafond du contexte RAG injecté dans le prompt (≈ 24k tokens)
     api_key: str = ""  # certains serveurs compatibles OpenAI exigent une clé factice
+
+    @field_validator("max_context_chars")
+    @classmethod
+    def _upgrade_legacy_max_context_chars(cls, v: int) -> int:
+        """L'ancien défaut (24 000 caractères ≈ 6k tokens) était écrit tel quel dans chaque ``workspace.json`` ;
+        il bridait le contexte dès 16k de fenêtre. On le relit comme « valeur par défaut », pas comme un choix."""
+        return DEFAULT_MAX_CONTEXT_CHARS if v == LEGACY_MAX_CONTEXT_CHARS else v
 
 
 class WorkspaceConfig(BaseModel):
