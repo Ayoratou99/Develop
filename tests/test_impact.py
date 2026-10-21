@@ -670,8 +670,10 @@ class Order
 }
 """
 
-_GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x",
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")}
+# Environnement du processus (PATH réel, SYSTEMROOT indispensable sous Windows) ; la configuration git de
+# l'utilisateur est neutralisée (fichiers global et système ignorés) pour des dépôts de test reproductibles.
+_GIT_ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@x", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 
 
 def _git(repo: Path, *args: str) -> None:

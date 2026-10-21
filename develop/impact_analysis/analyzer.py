@@ -37,6 +37,10 @@ from develop.code_analysis.model import route_paths_match
 from develop.config import WorkspaceConfig
 from develop.git_tools import ChangedFile, GitError, GitRepo, find_git_root
 from develop.impact_analysis.diff import changed_line_ranges, parse_unified_diff, ranges_intersect, symbols_touched
+
+# Sous Windows, git ne doit jamais ouvrir de console (fenêtre native « develop app ») ; sans effet ailleurs.
+_NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+              if hasattr(subprocess, "CREATE_NO_WINDOW") else {})
 from develop.project_scanner import (
     compute_sha1,
     decode_bytes,
@@ -477,7 +481,7 @@ class ImpactAnalyzer:
             args += ["--", prefix.rstrip("/")]
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C.UTF-8")
         try:
-            out = subprocess.run(args, capture_output=True, timeout=60, check=False, env=env)
+            out = subprocess.run(args, capture_output=True, timeout=60, check=False, env=env, **_NO_WINDOW)
         except (OSError, subprocess.SubprocessError) as exc:
             run.warn("Diff détaillé indisponible (%s) : les fichiers modifiés sont analysés en entier." % exc)
             return {}
@@ -1186,7 +1190,7 @@ def _git_show_bytes(git: GitRepo, path: str, rev: str) -> Optional[bytes]:
     args = ["git", "-C", str(git.root), "show", "%s:%s" % (rev, path)]
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C.UTF-8")
     try:
-        out = subprocess.run(args, capture_output=True, timeout=60, check=False, env=env)
+        out = subprocess.run(args, capture_output=True, timeout=60, check=False, env=env, **_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout if out.returncode == 0 else None

@@ -46,7 +46,7 @@ def _node_with_hooks() -> Optional[str]:
     if not exe:
         return None
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8", timeout=10, check=True).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.match(r"v(\d+)\.(\d+)", out)
@@ -59,7 +59,7 @@ def _run_harness(fixtures: Dict[str, Any]) -> Dict[str, Any]:
     node = _node_with_hooks()
     if node is None:
         pytest.skip("Node ≥ 22.15 absent")
-    proc = subprocess.run([node, str(HARNESS), json.dumps(fixtures)], capture_output=True, text=True, timeout=60, cwd=str(ROOT))
+    proc = subprocess.run([node, str(HARNESS), json.dumps(fixtures)], capture_output=True, text=True, encoding="utf-8", timeout=60, cwd=str(ROOT))
     assert proc.returncode == 0, proc.stderr
     assert "Warning" not in proc.stderr, proc.stderr
     return json.loads(proc.stdout)
@@ -81,7 +81,7 @@ def test_modules_have_valid_syntax_and_no_external_url():
         pytest.skip("node absent : syntaxe non vérifiée")
     for path in (CHAT_JS, SETUP_JS, SETTINGS_JS):
         proc = subprocess.run([node, "--input-type=module", "--check"], input=path.read_text(encoding="utf-8"),
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, encoding="utf-8", timeout=30)
         assert proc.returncode == 0, "%s : %s" % (path.name, proc.stderr)
 
 

@@ -20,6 +20,7 @@ from develop.api.routes import api_error, get_state, require_db
 from develop.api.state import AppState
 from develop.document_indexer import SUPPORTED_FORMATS, format_for_path, load_document
 from develop.indexing import Indexer
+from develop.project_scanner import path_is_within
 from develop.storage import Database, DocumentRow
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -228,7 +229,7 @@ def delete_document(doc_id: int, request: Request) -> Dict[str, Any]:
         docs_dir = os.path.realpath(str(config.documents_dir(ws.id)))
         try:
             real = os.path.realpath(doc.stored_path)
-            if real.startswith(docs_dir + os.sep) and os.path.isfile(real):
+            if real != docs_dir and path_is_within(docs_dir, real) and os.path.isfile(real):
                 os.remove(real)
                 removed_file = True
         except OSError:

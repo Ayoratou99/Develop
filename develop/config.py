@@ -16,6 +16,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import stat
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -122,11 +125,44 @@ def _settings_path() -> Path:
     return develop_home() / "settings.json"
 
 
+def _replace_with_retry(src: Path, dst: Path, attempts: int = 5) -> None:
+    """``os.replace`` atomique. Sous Windows, un antivirus, un éditeur ou l'indexeur de recherche peut tenir
+    la cible un instant (``PermissionError``) : quelques nouvelles tentatives rapprochées avant d'abandonner."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _atomic_write(path: Path, data: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    _replace_with_retry(tmp, path)
+
+
+def _rmtree(path: Path) -> None:
+    """``shutil.rmtree`` qui lève l'attribut « lecture seule » (Windows) avant de réessayer un fichier refusé."""
+
+    def _on_error(func, failed, exc_info):  # type: ignore[no-untyped-def]
+        exc = exc_info[1] if isinstance(exc_info, tuple) else exc_info
+        if isinstance(exc, PermissionError):
+            try:
+                os.chmod(failed, stat.S_IWRITE | stat.S_IREAD)
+                func(failed)
+                return
+            except OSError:
+                pass
+        raise exc
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_on_error)
+    else:
+        shutil.rmtree(path, onerror=_on_error)
 
 
 # --------------------------------------------------------------------------- réglages globaux
@@ -202,13 +238,15 @@ def create_workspace(name: str) -> WorkspaceConfig:
 
 
 def delete_workspace(workspace_id: str) -> bool:
-    """Supprime la mémoire Develop d'un espace (jamais les dépôts de l'utilisateur)."""
-    import shutil
+    """Supprime la mémoire Develop d'un espace (jamais les dépôts de l'utilisateur).
 
+    La base SQLite de l'espace doit être fermée avant l'appel : sous Windows, un fichier ouvert
+    (``memory.sqlite3``, son ``-wal``) ne peut pas être supprimé et l'appel lève ``PermissionError``.
+    """
     d = workspace_dir(workspace_id)
     if not d.exists():
         return False
-    shutil.rmtree(d)
+    _rmtree(d)
     settings = load_settings()
     if settings.active_workspace == workspace_id:
         settings.active_workspace = None

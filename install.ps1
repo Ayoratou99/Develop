@@ -4,6 +4,10 @@ Installe Develop sous Windows, sans Docker ni droits administrateur.
 
 .DESCRIPTION
     powershell -ExecutionPolicy Bypass -File install.ps1 [-Desktop] [-Python chemin] [-From chemin] [-BinDir dossier]
+    pwsh -ExecutionPolicy Bypass -File install.ps1 ...        (PowerShell 7)
+
+« -ExecutionPolicy Bypass » n'autorise que cette exécution : la politique d'exécution de la machine n'est
+pas modifiée. Windows PowerShell 5.1 et PowerShell 7 sont pris en charge.
 
 Ce que fait le script :
   1. cherche un Python 3.9 ou plus récent (py -3, python3, python) et explique comment l'installer sinon ;
@@ -32,6 +36,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PowerShell 7.4+ : un code de retour non nul d'une commande native ne doit pas interrompre le script, les
+# codes sont testés explicitement ci-dessous (variable sans effet dans Windows PowerShell 5.1).
+$PSNativeCommandUseErrorActionPreference = $false
+if ($env:OS -ne "Windows_NT") {
+    Write-Host "Ce script installe Develop sous Windows ; sur macOS et Linux, utilisez : sh install.sh" -ForegroundColor Yellow
+    exit 1
+}
 $ShimMark = "rem Genere par install.ps1 de Develop"
 
 $DevelopHome = if ($env:DEVELOP_HOME) { $env:DEVELOP_HOME } else { Join-Path $env:USERPROFILE ".develop" }
@@ -54,6 +65,19 @@ function Invoke-Native([string]$Exe, [string[]]$Arguments, [switch]$Quiet) {
         & $Exe @Arguments
     }
     return $LASTEXITCODE
+}
+
+# Sortie d'une commande native (stderr fusionné), sans exception ; son code de retour reste dans $LASTEXITCODE.
+function Get-NativeOutput([string]$Exe, [string[]]$Arguments) {
+    $ErrorActionPreference = "Continue"
+    $output = & $Exe @Arguments 2>&1
+    return ((@($output) | ForEach-Object { "$_" }) -join "`n").Trim()
+}
+
+# L'alias « python » du Microsoft Store (App Execution Alias) n'est pas un Python : il ouvre le magasin.
+function Test-StoreAlias([string]$Exe) {
+    $cmd = Get-Command $Exe -ErrorAction SilentlyContinue
+    return ($null -ne $cmd -and "$($cmd.Source)" -like "*\Microsoft\WindowsApps\*")
 }
 
 # Une commande Python peut être « py -3 » : on sépare l'exécutable de ses arguments.
@@ -82,6 +106,10 @@ if ($Python) {
     }
     if (-not $Python) {
         Write-Host "Aucun Python 3.9 ou plus récent trouvé." -ForegroundColor Yellow
+        if ((Test-StoreAlias "python") -or (Test-StoreAlias "python3")) {
+            Write-Host "(« python » est ici l'alias du Microsoft Store, pas un Python installé : installez Python, ou"
+            Write-Host " désactivez l'alias dans Paramètres > Applications > Alias d'exécution d'application.)"
+        }
         Write-Host "Installez Python 3.11 ou plus récent :"
         Write-Host "  - winget install Python.Python.3.12"
         Write-Host "  - ou depuis https://www.python.org/downloads/windows/ (cochez « Add python.exe to PATH »)"
@@ -91,8 +119,9 @@ if ($Python) {
 }
 $PyCmd = Split-Command $Python
 $versionArgs = @($PyCmd.Args) + @("-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])")
-$PyVersion = [string](& $PyCmd.Exe @versionArgs)
-Write-Host "Python : $Python ($($PyVersion.Trim()))"
+$PyVersion = Get-NativeOutput $PyCmd.Exe $versionArgs
+if ($LASTEXITCODE -ne 0) { Fail "« $Python » ne répond pas (code $LASTEXITCODE) : $PyVersion" }
+Write-Host "Python : $Python ($PyVersion)"
 
 # ----------------------------------------------------------------------------- 2. environnement
 
@@ -145,9 +174,9 @@ $suffix = if ($Desktop) { " (avec l'extra desktop)" } else { "" }
 Write-Host "Installation de Develop depuis $From$suffix..."
 $code = Invoke-Native $VenvPy @("-m", "pip", "install", "--disable-pip-version-check", "--quiet", "$From$Extras")
 if ($code -ne 0) { Fail "pip n'a pas pu installer Develop (voir les messages ci-dessus)." }
-$Version = [string](& $VenvPy -m develop --version)
-if ($LASTEXITCODE -ne 0) { Fail "Develop est installé mais « develop --version » échoue." }
-Write-Host "Installé : $($Version.Trim())"
+$Version = Get-NativeOutput $VenvPy @("-m", "develop", "--version")
+if ($LASTEXITCODE -ne 0) { Fail "Develop est installé mais « develop --version » échoue : $Version" }
+Write-Host "Installé : $Version"
 
 # ----------------------------------------------------------------------------- 4. commande develop
 
@@ -156,17 +185,26 @@ if ((Test-Path -LiteralPath $Shim) -and -not ((Get-Content -LiteralPath $Shim -R
     Fail "$Shim existe déjà et n'a pas été créé par ce script : supprimez-le ou utilisez -BinDir."
 }
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-# Dans le profil par défaut, le chemin est écrit avec %USERPROFILE% : le .cmd reste en ASCII
-# même si le nom d'utilisateur contient des accents.
-$defaultHome = Join-Path $env:USERPROFILE ".develop"
-$shimPython = if ($DevelopHome -eq $defaultHome) { '%USERPROFILE%\.develop\venv\Scripts\python.exe' } else { $VenvPy }
+# Sous le profil utilisateur, le chemin est écrit avec %USERPROFILE% : le .cmd reste en ASCII même si le nom
+# d'utilisateur contient des accents. Un chemin hors du profil et non ASCII (DEVELOP_HOME personnalisé) est
+# écrit dans la page de code OEM de la console, celle que cmd.exe utilise pour lire un .cmd.
+$profileRoot = "$env:USERPROFILE".TrimEnd("\")
+$shimPython = $VenvPy
+if ($profileRoot -and $VenvPy.Length -gt $profileRoot.Length -and
+        $VenvPy.Substring(0, $profileRoot.Length + 1) -ieq "$profileRoot\") {
+    $shimPython = "%USERPROFILE%" + $VenvPy.Substring($profileRoot.Length)
+}
 [string[]]$shimLines = @(
     "@echo off",
     $ShimMark,
     "rem Lance Develop depuis son environnement. Relancer install.ps1 met a jour l'installation.",
     "`"$shimPython`" -m develop %*"
 )
-[System.IO.File]::WriteAllLines($Shim, $shimLines, [System.Text.Encoding]::ASCII)
+$shimEncoding = [System.Text.Encoding]::ASCII
+if ($shimPython -match "[^\x00-\x7F]") {
+    $shimEncoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+}
+[System.IO.File]::WriteAllLines($Shim, $shimLines, $shimEncoding)
 Write-Host "Commande : $Shim"
 
 # PATH utilisateur (registre, type ExpandString conservé), puis notification aux autres programmes.
@@ -195,6 +233,7 @@ if (($env:Path -split ";") -notcontains $BinDir) { $env:Path = "$env:Path;$BinDi
 
 Write-Host ""
 Write-Host "Develop est installé." -ForegroundColor Green
+Write-Host "Dossier Develop : $DevelopHome (environnement, réglages, mémoire des projets ; DEVELOP_HOME pour changer)"
 Write-Host "Prochaines étapes (dans un nouveau terminal) :"
 Write-Host "  develop doctor     diagnostic de la machine et modèles recommandés"
 Write-Host "  develop serve      interface dans le navigateur (http://127.0.0.1:8765)"

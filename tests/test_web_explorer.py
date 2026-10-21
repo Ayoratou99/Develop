@@ -61,7 +61,7 @@ def test_format_field_value_renders_null_and_empty_as_dash(tmp_path):
         + "process.stdout.write('\\n' + JSON.stringify([formatFieldValue(undefined), formatFieldValue([]), formatFieldValue(['a', 'b'])]));\n",
         encoding="utf-8",
     )
-    out = subprocess.run([node, str(script), json.dumps(cases)], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run([node, str(script), json.dumps(cases)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     rows_line, extra_line = out.split("\n")
     rows = json.loads(rows_line)
     assert rows[0] == ["reference", "—", "—", "—", "—"]

@@ -16,9 +16,12 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 _GB = 1024 ** 3
+# Sous Windows, aucune sonde ne doit faire apparaître de console (fenêtre native « develop app »).
+_NO_WINDOW: Dict[str, int] = ({"creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+                              if hasattr(subprocess, "CREATE_NO_WINDOW") else {})
 
 
 @dataclass
@@ -71,11 +74,15 @@ class MachineProfile:
 # --------------------------------------------------------------------------- utilitaires
 
 def _run(cmd: List[str], timeout: float = 3.0) -> Optional[str]:
-    """Exécute une commande et renvoie stdout, ou None en cas d'échec/timeout/absence."""
+    """Exécute une commande et renvoie stdout, ou None en cas d'échec/timeout/absence/refus.
+
+    Décodage UTF-8 avec remplacement : la console Windows (cp1252, cp850) ne garantit pas un flux décodable.
+    """
     if shutil.which(cmd[0]) is None:
         return None
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=timeout, check=False, **_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -279,46 +286,153 @@ def _windows_memory() -> Dict[str, Optional[float]]:
         ]
 
     try:
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))  # type: ignore[attr-defined]
-        return {"total": _to_gb(stat.ullTotalPhys), "available": _to_gb(stat.ullAvailPhys)}
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # AttributeError hors Windows
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) or not status.ullTotalPhys:
+            return {"total": None, "available": None}  # appel refusé (renvoie 0) : rien d'inventé
+        return {"total": _to_gb(status.ullTotalPhys), "available": _to_gb(status.ullAvailPhys)}
     except Exception:  # noqa: BLE001 - toute erreur ctypes
         return {"total": None, "available": None}
 
 
-def _windows_gpus() -> List[GpuInfo]:
-    gpus = _nvidia_gpus()
-    if gpus:
-        return gpus
-    out = _run(["powershell", "-NoProfile", "-Command",
-                "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json"], timeout=8.0)
-    if not out:
-        return gpus
+_WIN_CPU_KEY = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+_WIN_DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+_WIN_ADAPTER_RAM_CAP = 4095 * 1024 * 1024  # Win32_VideoController.AdapterRAM est un uint32 : faux au-delà de 4 Go
+_WIN_INVENTORY_SCRIPT = (
+    "$ErrorActionPreference = 'SilentlyContinue'; "
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "$cpu = @(Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores); "
+    "$gpu = @(Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM); "
+    "@{ cpu = $cpu; gpu = $gpu } | ConvertTo-Json -Compress -Depth 3"
+)
+
+
+def _gpu_vendor(name: str) -> str:
+    low = name.lower()
+    if "nvidia" in low:
+        return "nvidia"
+    if "amd" in low or "radeon" in low:
+        return "amd"
+    if "intel" in low:
+        return "intel"
+    return "unknown"
+
+
+def _windows_registry_value(key: str, name: str):  # type: ignore[no-untyped-def]
+    """Valeur ``HKLM\\key\\name`` ou ``None`` (clé absente, droits insuffisants, hors Windows)."""
     try:
-        data = json.loads(out)
-        if isinstance(data, dict):
-            data = [data]
-        for item in data:
-            name = str(item.get("Name") or "GPU")
-            ram = item.get("AdapterRAM")
-            vram = _to_gb(float(ram)) if isinstance(ram, (int, float)) and ram > 0 else None
-            low = name.lower()
-            vendor = "nvidia" if "nvidia" in low else ("amd" if ("amd" in low or "radeon" in low) else ("intel" if "intel" in low else "unknown"))
-            gpus.append(GpuInfo(vendor=vendor, name=name, vram_gb=vram))
-    except (ValueError, TypeError, AttributeError):
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as handle:
+            value, _kind = winreg.QueryValueEx(handle, name)
+            return value
+    except OSError:
+        return None
+
+
+def _windows_registry_subkeys(key: str) -> List[str]:
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+    names: List[str] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as handle:
+            count = winreg.QueryInfoKey(handle)[0]
+            for i in range(count):
+                try:
+                    names.append(winreg.EnumKey(handle, i))
+                except OSError:
+                    break
+    except OSError:
         pass
+    return names
+
+
+def _windows_cpu_model() -> str:
+    """Nom commercial du processeur (registre, sans sous-processus) ; ``platform.processor`` en repli."""
+    name = _windows_registry_value(_WIN_CPU_KEY, "ProcessorNameString")
+    text = " ".join(str(name).split()) if name else ""
+    return text or platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "")
+
+
+def _windows_gpus_registry() -> List[GpuInfo]:
+    """Cartes graphiques d'après la classe « Display » du registre : nom du pilote et VRAM 64 bits
+    (``HardwareInformation.qwMemorySize``), fiable au-delà de 4 Go contrairement à WMI. Sans sous-processus."""
+    gpus: List[GpuInfo] = []
+    seen: set = set()
+    for sub in _windows_registry_subkeys(_WIN_DISPLAY_CLASS_KEY):
+        if not sub.isdigit():
+            continue
+        key = _WIN_DISPLAY_CLASS_KEY + "\\" + sub
+        name = _windows_registry_value(key, "DriverDesc")
+        label = " ".join(str(name).split()) if name else ""
+        if not label or label in seen or "microsoft" in label.lower():  # Basic/Remote Display Adapter : pas un GPU
+            continue
+        raw = _windows_registry_value(key, "HardwareInformation.qwMemorySize")
+        if isinstance(raw, (bytes, bytearray)):
+            raw = int.from_bytes(bytes(raw)[:8], "little") if raw else 0
+        vram = _to_gb(float(raw)) if isinstance(raw, int) and raw > 0 else None
+        seen.add(label)
+        gpus.append(GpuInfo(vendor=_gpu_vendor(label), name=label, vram_gb=vram))
     return gpus
 
 
+def _windows_inventory() -> Tuple[Optional[int], List[GpuInfo]]:
+    """Un seul appel PowerShell (``Get-CimInstance``, timeout 10 s) : coeurs physiques et cartes graphiques.
+
+    ``AdapterRAM`` est ignoré au-delà de 4 Go (compteur 32 bits). ``(None, [])`` si PowerShell manque,
+    échoue ou dépasse le délai : jamais d'exception.
+    """
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        return None, []
+    out = _run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+                _WIN_INVENTORY_SCRIPT], timeout=10.0)
+    if not out:
+        return None, []
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None, []
+    if not isinstance(data, dict):
+        return None, []
+
+    def _items(value):  # type: ignore[no-untyped-def]
+        if isinstance(value, dict):
+            return [value]
+        return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+    cores = 0
+    for item in _items(data.get("cpu")):
+        n = item.get("NumberOfCores")
+        if isinstance(n, (int, float)) and n > 0:
+            cores += int(n)
+    gpus: List[GpuInfo] = []
+    for item in _items(data.get("gpu")):
+        name = " ".join(str(item.get("Name") or "").split())
+        if not name:
+            continue
+        ram = item.get("AdapterRAM")
+        vram = _to_gb(float(ram)) if isinstance(ram, (int, float)) and 0 < ram < _WIN_ADAPTER_RAM_CAP else None
+        gpus.append(GpuInfo(vendor=_gpu_vendor(name), name=name, vram_gb=vram))
+    return (cores or None), gpus
+
+
 def _detect_windows(profile: MachineProfile) -> None:
-    profile.cpu_model = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "")
+    profile.cpu_model = _windows_cpu_model()
     profile.cpu_cores_logical = os.cpu_count()
     profile.cpu_cores_physical = None
     mem = _windows_memory()
     profile.ram_total_gb = mem["total"]
     profile.ram_available_gb = mem["available"]
-    profile.gpus = _windows_gpus()
+    gpus = _nvidia_gpus() or _windows_gpus_registry()
+    cores, cim_gpus = _windows_inventory()
+    profile.cpu_cores_physical = cores
+    profile.gpus = gpus or cim_gpus
 
 
 # --------------------------------------------------------------------------- commun

@@ -7,10 +7,10 @@
 //
 // Usage : node impact_view_harness.mjs '<rapport ImpactReport en JSON>' [source=file|symbol|git]
 import * as nodeModule from 'node:module';
-import { pathToFileURL } from 'node:url';
-import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const STATIC_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../develop/web/static');
+// fileURLToPath : valable aussi sous Windows (« new URL(...).pathname » y donne « /C:/... » et laisse les %20).
+const STATIC_DIR = fileURLToPath(new URL('../../develop/web/static', import.meta.url));
 
 // ------------------------------------------------------------------ DOM minimal
 class StubClassList {

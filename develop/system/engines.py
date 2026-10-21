@@ -64,11 +64,19 @@ class EnginesReport:
                 "recommended_engine": self.recommended_engine, "recommended_base_url": self.recommended_base_url}
 
 
+# Sous Windows, un processus enfant ne doit jamais faire apparaître de console (fenêtre native « develop app »).
+_NO_WINDOW: Dict[str, int] = ({"creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+                              if hasattr(subprocess, "CREATE_NO_WINDOW") else {})
+
+
 def _run(cmd: List[str], timeout: float = 4.0) -> Optional[str]:
+    """Sortie standard d'une commande (décodée en UTF-8, caractères invalides remplacés : la console Windows
+    n'est pas en UTF-8) ; ``None`` si la commande est absente, échoue, dépasse ``timeout`` ou est refusée."""
     if shutil.which(cmd[0]) is None:
         return None
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=timeout, check=False, **_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() if out.returncode == 0 else None

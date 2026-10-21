@@ -36,7 +36,7 @@ def _node_with_hooks() -> Optional[str]:
     if not exe:
         return None
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8", timeout=10, check=True).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.match(r"v(\d+)\.(\d+)", out)
@@ -49,7 +49,7 @@ def _run_harness(fixtures: Dict[str, Any]) -> Dict[str, Any]:
     node = _node_with_hooks()
     if node is None:
         pytest.skip("Node ≥ 22.15 absent")
-    proc = subprocess.run([node, str(HARNESS), json.dumps(fixtures)], capture_output=True, text=True, timeout=60, cwd=str(ROOT))
+    proc = subprocess.run([node, str(HARNESS), json.dumps(fixtures)], capture_output=True, text=True, encoding="utf-8", timeout=60, cwd=str(ROOT))
     assert proc.returncode == 0, proc.stderr
     assert "Warning" not in proc.stderr, proc.stderr
     return json.loads(proc.stdout)

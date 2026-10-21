@@ -38,13 +38,30 @@ from develop.project_scanner import (
     sniff_binary,
 )
 
-_GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@x", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
+# Environnement du processus (PATH réel, SYSTEMROOT indispensable sous Windows) ; la configuration git de
+# l'utilisateur est neutralisée (fichiers global et système ignorés) pour des dépôts de test reproductibles.
+_GIT_ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@x", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
                    env=dict(_GIT_ENV, HOME=str(repo)))
+
+
+def _try_symlink(target: Path, link: Path) -> bool:
+    """Crée un lien symbolique ; faux si le système le refuse (Windows sans mode développeur ni droits)."""
+    try:
+        os.symlink(target, link, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+def _symlink(target: Path, link: Path) -> None:
+    """Lien symbolique, ou ``pytest.skip`` quand le système ne les permet pas."""
+    if not _try_symlink(target, link):
+        pytest.skip("liens symboliques indisponibles (Windows sans mode développeur)")
 
 
 def _write(path: Path, content: str = "x\n") -> Path:
@@ -327,8 +344,8 @@ def test_scan_gitignore_without_git(tmp_path: Path):
 
 def test_scan_symlinks_not_followed(tmp_path: Path):
     _write(tmp_path / "real" / "a.py")
-    os.symlink(tmp_path / "real", tmp_path / "linkdir")
-    os.symlink(tmp_path / "real" / "a.py", tmp_path / "link.py")
+    _symlink(tmp_path / "real", tmp_path / "linkdir")
+    _symlink(tmp_path / "real" / "a.py", tmp_path / "link.py")
     res = scan_repo(str(tmp_path), "r", use_git=False)
     assert _paths(res) == ["real/a.py"] and res.skipped["symlink"] == 2
 
@@ -372,7 +389,7 @@ def git_repo(tmp_path: Path) -> Path:
 def test_scan_git_repo(git_repo: Path):
     _write(git_repo / "src" / "new.py", "print('new')\n")  # non suivi mais pas ignoré
     _write(git_repo / "node_modules" / "x" / "index.js")  # non suivi, non ignoré par git : exclu par défaut
-    os.symlink(git_repo / "src" / "a.py", git_repo / "src" / "link.py")
+    linked = _try_symlink(git_repo / "src" / "a.py", git_repo / "src" / "link.py")  # facultatif sous Windows
     res = scan_repo(str(git_repo), "g", use_git=True)
     assert res.used_git is True and res.warnings == []
     paths = _paths(res)
@@ -380,7 +397,7 @@ def test_scan_git_repo(git_repo: Path):
     assert "ignored/junk.py" not in paths and "debug.log" not in paths
     assert res.skipped["excluded_dir"] == 2  # vendor/lib.php, node_modules/x/index.js
     assert res.skipped["excluded_file"] == 1  # yarn.lock
-    assert res.skipped["symlink"] == 1 and res.skipped["no_language"] == 1  # .gitignore
+    assert res.skipped["symlink"] == (1 if linked else 0) and res.skipped["no_language"] == 1  # .gitignore
 
 
 @needs_git

@@ -1,0 +1,16 @@
+# Fins de ligne identiques sur Windows, macOS et Linux : les tests comparent des contenus, des tailles et
+# des empreintes de fichiers de tests/fixtures ; install.sh doit rester en LF (« #!/bin/sh ») ; les bancs
+# Node (tests/web_harness) et les sources Python aussi. Windows PowerShell lit install.ps1 en LF sans souci.
+* text=auto eol=lf
+
+# Binaires : jamais convertis
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.sqlite3 binary
+*.woff binary
+*.woff2 binary

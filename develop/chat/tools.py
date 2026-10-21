@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from develop.chat.budget import estimate_tokens
 from develop.chat.context_builder import LocalHit
 from develop.llm.base import ToolCall, ToolSpec
+from develop.project_scanner import path_is_within
 from develop.storage import Database, node_key
 
 logger = logging.getLogger("develop.chat.tools")
@@ -376,8 +377,8 @@ class ToolExecutor:
             full = (root / rel).resolve()
         except OSError:
             return None
-        if not str(full).startswith(str(root)) or not full.is_file():
-            return None
+        if not path_is_within(str(root), str(full)) or not full.is_file():
+            return None  # hors du dépôt (lien, « .. ») : refusé ; comparaison insensible à la casse sous Windows
         try:
             if full.stat().st_size > MAX_FILE_BYTES:
                 return None

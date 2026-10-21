@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from develop.chat.budget import estimate_tokens
+from develop.project_scanner import path_is_within
 from develop.search.engine import is_generated_file
 
 logger = logging.getLogger("develop.chat")
@@ -645,7 +646,7 @@ class _CardLoader:
             full = os.path.realpath(os.path.join(root_real, rel))
         except (OSError, ValueError):
             return None
-        if full != root_real and not full.startswith(root_real.rstrip(os.sep) + os.sep):
+        if not path_is_within(root_real, full):
             return None
         try:
             if not os.path.isfile(full) or os.path.getsize(full) > CARD_MAX_FILE_BYTES:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import stat as stat_module
 import string
 import sys
 from pathlib import Path
@@ -156,8 +157,13 @@ async def delete_workspace(workspace_id: str, request: Request) -> Dict[str, Any
     if was_active:
         if state.index_running:
             raise api_error(409, "index_running", "Une indexation est en cours : attendez sa fin ou annulez-la.")
-        state.detach()
-    config.delete_workspace(workspace_id)
+        state.detach()  # ferme memory.sqlite3 (et son -wal) : indispensable sous Windows avant de supprimer
+    try:
+        config.delete_workspace(workspace_id)
+    except OSError as exc:
+        raise api_error(409, "workspace_locked",
+                        "Impossible de supprimer la mémoire de l'espace « %s » : un fichier est encore utilisé "
+                        "(%s). Fermez les autres programmes qui l'ouvrent, puis réessayez." % (workspace_id, exc))
     state.settings = config.load_settings()
     if was_active:
         state.load_workspace(None)
@@ -211,6 +217,36 @@ def _entry(path: str, name: Optional[str] = None) -> Dict[str, Any]:
             "is_git": _is_git_dir(path), "has_marker": _has_marker(path)}
 
 
+def _windows_drives() -> List[str]:
+    """Lecteurs présents (``C:\\``, ``D:\\``…) : ``os.listdrives`` (Python ≥ 3.12, instantané) ou, à défaut,
+    les lettres dont la racine existe. Un lecteur réseau déconnecté peut faire attendre ``exists`` : tolérable."""
+    listdrives = getattr(os, "listdrives", None)
+    if listdrives is not None:
+        try:
+            return sorted(str(d) for d in listdrives())
+        except OSError:
+            pass
+    drives: List[str] = []
+    for letter in string.ascii_uppercase:
+        drive = "%s:\\" % letter
+        try:
+            if os.path.exists(drive):
+                drives.append(drive)
+        except OSError:
+            continue
+    return drives
+
+
+def _windows_hidden(path: str) -> bool:
+    """Dossier caché ou système sous Windows (équivalent du « . » initial ailleurs) ; faux en cas de doute."""
+    try:
+        attrs = getattr(os.stat(path, follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return False
+    hidden = getattr(stat_module, "FILE_ATTRIBUTE_HIDDEN", 0x2) | getattr(stat_module, "FILE_ATTRIBUTE_SYSTEM", 0x4)
+    return bool(attrs & hidden)
+
+
 def browse_roots() -> List[Dict[str, Any]]:
     """Racines proposées : dossier personnel, volumes (macOS), lecteurs (Windows), ``/`` (Linux)."""
     roots: List[Dict[str, Any]] = []
@@ -227,10 +263,8 @@ def browse_roots() -> List[Dict[str, Any]]:
         except OSError:
             pass
     elif sys.platform.startswith("win"):
-        for letter in string.ascii_uppercase:
-            drive = "%s:\\" % letter
-            if os.path.isdir(drive):
-                roots.append(_entry(drive, drive))
+        for drive in _windows_drives():
+            roots.append(_entry(drive, drive))
     else:
         roots.append(_entry("/", "/"))
     return roots
@@ -253,6 +287,7 @@ def browse(body: PathBody = Body(default_factory=PathBody)) -> Dict[str, Any]:
         raise api_error(400, "unreadable_directory", "Impossible de lire « %s » : %s." % (path, exc))
     entries: List[Dict[str, Any]] = []
     truncated = False
+    on_windows = sys.platform.startswith("win")
     for name in names:
         if name.startswith("."):
             continue
@@ -260,6 +295,8 @@ def browse(body: PathBody = Body(default_factory=PathBody)) -> Dict[str, Any]:
         try:
             if os.path.islink(full) or not os.path.isdir(full):
                 continue
+            if on_windows and _windows_hidden(full):
+                continue  # $RECYCLE.BIN, System Volume Information, AppData… : cachés comme les « .x » ailleurs
         except OSError:
             continue
         if len(entries) >= MAX_BROWSE_ENTRIES:
@@ -268,6 +305,6 @@ def browse(body: PathBody = Body(default_factory=PathBody)) -> Dict[str, Any]:
         entries.append(_entry(full, name))
     parent = os.path.dirname(path)
     if parent == path:
-        parent = None
+        parent = None  # racine (« / », « C:\ », partage UNC)
     return {"path": path, "parent": parent, "entries": entries, "truncated": truncated,
             "is_git": _is_git_dir(path), "has_marker": _has_marker(path, names)}

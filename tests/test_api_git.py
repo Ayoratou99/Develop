@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(not git_available(), reason="git absent")
 
 
 def _git(root: Path, *args: str) -> None:
-    env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")  # « nul » sous Windows
     subprocess.run(["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.com",
                     "-c", "commit.gpgsign=false", *args], check=True, capture_output=True, env=env)
 

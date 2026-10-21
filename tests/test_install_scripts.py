@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,7 +43,9 @@ exit 1
 
 TOOLS = ("sh", "cat", "cp", "mkdir", "rm", "chmod", "grep", "uname", "basename", "dirname")
 
-needs_sh = pytest.mark.skipif(shutil.which("sh") is None, reason="sh absent (Windows)")
+# install.sh est le script POSIX : sous Windows (même avec le sh de Git), c'est install.ps1 qui compte.
+needs_sh = pytest.mark.skipif(sys.platform == "win32" or shutil.which("sh") is None,
+                              reason="install.sh est réservé à macOS/Linux (sous Windows : install.ps1)")
 
 
 def _tools_dir(tmp_path: Path) -> Path:
@@ -95,6 +98,7 @@ def test_install_sh_syntax(shell: str):
     assert proc.returncode == 0, proc.stderr
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="bit exécutable sans objet sous Windows")
 def test_install_sh_is_executable_and_posix():
     assert os.access(INSTALL_SH, os.X_OK)
     first = INSTALL_SH.read_text(encoding="utf-8").splitlines()[0]
@@ -214,6 +218,50 @@ def test_install_ps1_is_utf8_with_bom():
     raw = INSTALL_PS1.read_bytes()
     assert raw.startswith(b"\xef\xbb\xbf")
     raw.decode("utf-8")
+
+
+def test_install_ps1_static_consistency():
+    """Relecture statique d'install.ps1 (jamais exécuté sur macOS/Linux) : les blocs attendus sont présents et
+    dans l'ordre : garde Windows, codes de retour natifs maîtrisés, détection de Python (py -3, python3,
+    python ; alias du Microsoft Store refusé), venv, pip, shim ``develop.cmd``, PATH utilisateur (registre,
+    sans doublon), ``DEVELOP_HOME``, message final ; politique d'exécution documentée dans l'en-tête."""
+    text = INSTALL_PS1.read_text(encoding="utf-8-sig")
+    ordered = [
+        "-ExecutionPolicy Bypass -File install.ps1",  # en-tête : commande d'installation documentée
+        "[CmdletBinding()]",
+        '$ErrorActionPreference = "Stop"',
+        "$PSNativeCommandUseErrorActionPreference = $false",  # PowerShell 7.4+ : codes de retour testés à la main
+        '$env:OS -ne "Windows_NT"',  # garde : pas pwsh sous macOS/Linux
+        "$env:DEVELOP_HOME",
+        "function Invoke-Native",
+        "WindowsApps",  # Test-StoreAlias : l'alias du Microsoft Store n'est pas un Python
+        "function Test-PythonOk",
+        '"py -3", "python3", "python"',  # ordre de détection
+        'Test-StoreAlias "python"',  # … et l'alias est expliqué à l'utilisateur quand rien n'est trouvé
+        'Fail "la création de l\'environnement a échoué."',
+        '"-m", "pip", "install"',
+        '"-m", "develop", "--version"',
+        'Join-Path $BinDir "develop.cmd"',
+        "-m develop %*",
+        'HKCU:\\Environment',  # PATH utilisateur : registre, valeur ExpandString conservée
+        "-notcontains",  # pas de doublon
+        "ExpandString",
+        "SendMessageTimeout",  # WM_SETTINGCHANGE : nouveau PATH sans redémarrer la session
+        "Develop est installé",
+        "develop doctor",
+    ]
+    position = -1
+    for block in ordered:
+        found = text.find(block, position + 1)
+        assert found >= 0, "bloc absent ou hors séquence : %s" % block
+        position = found
+    assert "shell=True" not in text and "Invoke-Expression" not in text
+    assert "\t" not in text, "tabulations : l'indentation est en espaces"
+    assert text.count("{") == text.count("}"), "accolades déséquilibrées"
+    assert text.count("(") == text.count(")"), "parenthèses déséquilibrées"
+    assert "Set-ExecutionPolicy" not in text  # le script documente -ExecutionPolicy Bypass, il ne modifie rien
+    assert "$ShimMark" in text and "n'a pas été créé par ce script" in text  # idempotence et refus d'écraser
+    assert "(existant, réutilisé)" in text and "(inutilisable, recréé)" in text
 
 
 def test_install_ps1_parses_with_powershell():

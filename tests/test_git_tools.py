@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -9,11 +10,14 @@ from develop.git_tools import GitError, GitRepo, find_git_root, git_available
 
 pytestmark = pytest.mark.skipif(not git_available(), reason="git absent")
 
+# Environnement du processus (PATH réel, SYSTEMROOT indispensable sous Windows) ; la configuration git de
+# l'utilisateur est neutralisée (fichiers global et système ignorés) pour des dépôts de test reproductibles.
+_GIT_ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@x", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
 
 def _git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
-                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
-                        "GIT_COMMITTER_EMAIL": "t@x", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "HOME": str(repo)})
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=dict(_GIT_ENV, HOME=str(repo)))
 
 
 @pytest.fixture

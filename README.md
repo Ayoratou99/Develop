@@ -1,5 +1,7 @@
 # Develop
 
+[![CI](https://github.com/Ayoratou99/Develop/actions/workflows/ci.yml/badge.svg)](https://github.com/Ayoratou99/Develop/actions/workflows/ci.yml)
+
 **Develop** est la mémoire locale d'un projet logiciel : un outil de développeur, entièrement en Python, qui lit vos
 dépôts (frontend, backend, base de données, documentation), vos documents de conception et vos notes datées, construit
 une carte citable du projet (fichiers, symboles, routes, modèles de données, relations) et vous laisse l'interroger
@@ -55,18 +57,28 @@ Develop s'installe comme un outil Python, en une commande, sans Docker ni sudo :
 git clone https://github.com/Ayoratou99/Develop.git && cd Develop && sh install.sh
 ```
 
-**Windows (PowerShell)**
+**Windows (Windows PowerShell 5.1 ou PowerShell 7)**
 
 ```powershell
 git clone https://github.com/Ayoratou99/Develop.git; cd Develop; powershell -ExecutionPolicy Bypass -File install.ps1
 ```
+
+(`pwsh` à la place de `powershell` sous PowerShell 7.) `-ExecutionPolicy Bypass` n'autorise que cette exécution : la
+politique d'exécution de la machine n'est pas modifiée et aucun droit administrateur n'est requis. Le script cherche
+Python (`py -3`, `python3`, `python` ; l'alias du Microsoft Store, qui n'est pas un Python, est refusé et expliqué),
+crée l'environnement `%USERPROFILE%\.develop\venv`, y installe Develop, écrit la commande
+`%USERPROFILE%\.develop\bin\develop.cmd` et ajoute ce dossier au PATH utilisateur (registre, sans doublon).
+**Ouvrez ensuite un nouveau terminal** pour que `develop` soit reconnu. `DEVELOP_HOME` désigne un autre dossier pour
+l'environnement, les réglages et la mémoire des projets : définissez-le avant l'installation et dans la session qui
+lance `develop`. Avec `develop serve`, Ctrl+C peut afficher « Terminer le programme de commandes (O/N) ? » : répondez O.
 
 Le script vérifie Python ≥ 3.9 (et indique comment l'installer sinon : Homebrew ou python.org, winget sous Windows),
 crée l'environnement, installe le paquet, puis place la commande `develop` dans `~/.local/bin` (macOS/Linux, avec la
 ligne à ajouter au PATH si besoin) ou dans `%USERPROFILE%\.develop\bin` ajouté au PATH utilisateur (Windows).
 Relancer le script met à jour l'installation. Options : `--desktop` (fenêtre native, voir « Lancer »),
 `--python CHEMIN`, `--from CHEMIN` (dossier, archive `.tar.gz`/`.zip` ou wheel), `--bin-dir DOSSIER`
-(`-Desktop`, `-Python`, `-From`, `-BinDir` sous Windows). Seul pip utilise le réseau.
+(`-Desktop`, `-Python`, `-From`, `-BinDir` sous Windows). Seul pip utilise le réseau. Installation et suite de
+tests sont **testées par la CI sur Windows, macOS et Linux**.
 
 **Alternative : pipx**, depuis le dépôt cloné :
 

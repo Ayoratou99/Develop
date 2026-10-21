@@ -17,6 +17,11 @@ class GitError(RuntimeError):
     pass
 
 
+# Sous Windows, git ne doit jamais ouvrir de console (fenêtre native « develop app ») ; sans effet ailleurs.
+_NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+              if hasattr(subprocess, "CREATE_NO_WINDOW") else {})
+
+
 @dataclass(frozen=True)
 class ChangedFile:
     path: str  # relatif à la racine du dépôt, séparateur "/"
@@ -43,13 +48,16 @@ def find_git_root(path: str) -> Optional[Path]:
     p = Path(path).resolve()
     start = p if p.is_dir() else p.parent
     try:
-        out = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, timeout=10, check=False)
+        # Décodage UTF-8 explicite : sous Windows, text=True seul lirait le chemin en cp1252 (accents altérés).
+        out = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=10, check=False,
+                             env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0"), **_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
         return None
-    return Path(out.stdout.strip())
+    top = out.stdout.strip()
+    return Path(top) if top else None
 
 
 class GitRepo:
@@ -66,7 +74,7 @@ class GitRepo:
         # GIT_OPTIONAL_LOCKS=0 : ne jamais rafraîchir .git/index (lecture seule stricte, pas de verrou disputé avec l'IDE)
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C.UTF-8")
         try:
-            out = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False, env=env)
+            out = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False, env=env, **_NO_WINDOW)
         except (OSError, subprocess.SubprocessError) as exc:
             raise GitError("git %s: %s" % (" ".join(args[:2]), exc)) from exc
         if out.returncode != 0:

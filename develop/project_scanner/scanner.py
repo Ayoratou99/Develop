@@ -98,6 +98,43 @@ def nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text) if text else text
 
 
+def path_is_within(root: str, path: str) -> bool:
+    """Vrai si ``path`` est ``root`` ou un chemin en dessous (chemins absolus, déjà résolus par l'appelant).
+
+    La comparaison respecte la casse du système de fichiers (``os.path.normcase`` : insensible sous Windows)
+    et exige une frontière de dossier : ``/a/b`` ne contient pas ``/a/bc``.
+    """
+    r = os.path.normcase(os.path.normpath(root))
+    p = os.path.normcase(os.path.normpath(path))
+    if p == r:
+        return True
+    return p.startswith(r if r.endswith(os.sep) else r + os.sep)
+
+
+def _is_junction(entry: "os.DirEntry[str]") -> bool:
+    """Vrai pour une jonction ou un point de montage NTFS (Windows), que ``is_symlink`` ne signale pas ;
+    toujours faux ailleurs. Les fichiers « dans le nuage » (OneDrive) portent aussi un point d'analyse mais
+    ne sont pas des jonctions : seule l'étiquette MOUNT_POINT compte. Une jonction suivie pourrait boucler."""
+    if os.name != "nt":
+        return False
+    is_junction = getattr(entry, "is_junction", None)  # Python ≥ 3.12
+    if is_junction is not None:
+        try:
+            return bool(is_junction())
+        except OSError:
+            return False
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    tag = getattr(st, "st_reparse_tag", 0)
+    return bool(attrs & stat_module.FILE_ATTRIBUTE_REPARSE_POINT) and tag == _IO_REPARSE_TAG_MOUNT_POINT
+
+
+_IO_REPARSE_TAG_MOUNT_POINT = getattr(stat_module, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+
 def _normalize_patterns(patterns: Sequence[str]) -> Tuple[str, ...]:
     out: List[str] = []
     for raw in patterns or ():
@@ -242,7 +279,7 @@ def _walk_candidates(root_abs: str, patterns: Sequence[str], result: ScanResult)
             name = nfc(entry.name)  # clé NFC ; entry.path garde le nom brut pour les accès disque
             rel = name if not rel_dir else rel_dir + "/" + name
             try:
-                if entry.is_symlink():
+                if entry.is_symlink() or _is_junction(entry):
                     result.skipped["symlink"] += 1
                     continue
                 is_dir = entry.is_dir(follow_symlinks=False)

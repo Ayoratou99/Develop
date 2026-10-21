@@ -1,0 +1,385 @@
+# CI de Develop : tests sur Linux, macOS et Windows (Python 3.9 et 3.12), parcours réel des scripts
+# d'installation (install.sh, install.ps1) et démarrage du serveur. En cas d'échec, une issue
+# « CI : échec » est créée ou mise à jour avec les 150 dernières lignes de chaque job en échec ;
+# elle est fermée automatiquement dès que la CI repasse au vert. Voir docs/CI.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  CI_ISSUE_TITLE: "CI : échec"
+
+jobs:
+  # --------------------------------------------------------------------------- tests
+  tests:
+    name: tests (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    env:
+      # Les tests n'écrivent jamais dans ~/.develop du runner : tout va dans le dossier temporaire.
+      DEVELOP_HOME: ${{ runner.temp }}/develop-home
+      CI_LOGS: ${{ runner.temp }}/ci-logs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # Les harness web (tests/web_harness/*.mjs) exigent module.registerHooks, donc Node >= 22.15 :
+      # sans lui les tests test_web_* seraient simplement ignorés. 24 est la version LTS courante.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Installer Develop et les dépendances de test
+        run: python -m pip install -e ".[dev]"
+
+      - name: Versions
+        shell: bash
+        run: |
+          python --version
+          python -m pip --version
+          node --version
+          git --version
+
+      - name: Tests (pytest)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$CI_LOGS" "$DEVELOP_HOME"
+          python -m pytest tests -o addopts='' -q --durations=10 2>&1 | tee "$CI_LOGS/output.log"
+
+      - name: Tests (pytest, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          New-Item -ItemType Directory -Force -Path $env:CI_LOGS, $env:DEVELOP_HOME | Out-Null
+          python -m pytest tests -o addopts='' -q --durations=10 2>&1 | Tee-Object -FilePath (Join-Path $env:CI_LOGS 'output.log')
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { $code = 1 }
+          exit $code
+
+      - name: Sortie de pytest (artefact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ matrix.os }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/ci-logs
+          if-no-files-found: warn
+          retention-days: 14
+
+  # --------------------------------------------------------------------------- scripts d'installation
+  install-scripts:
+    name: install-scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CI_LOGS: ${{ runner.temp }}/ci-logs
+    steps:
+      - uses: actions/checkout@v4
+
+      # Garantit qu'un Python >= 3.9 est dans le PATH ; les scripts choisissent eux-mêmes leur Python,
+      # exactement comme chez l'utilisateur.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ---- macOS / Linux : sh install.sh avec HOME redirigé, puis la commande installée
+      - name: install.sh (HOME redirigé vers le dossier temporaire)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          HOME: ${{ runner.temp }}/home
+        run: |
+          mkdir -p "$HOME" "$CI_LOGS"
+          {
+            set -e
+            echo "== sh install.sh   (HOME=$HOME)"
+            sh install.sh
+            DEVELOP="$HOME/.local/bin/develop"
+            echo "== $DEVELOP --version"
+            "$DEVELOP" --version
+            echo "== develop doctor --json"
+            "$DEVELOP" doctor --json
+            echo "== develop status --json"
+            "$DEVELOP" status --json
+          } 2>&1 | tee -a "$CI_LOGS/output.log"
+
+      - name: Serveur (develop serve --no-browser, puis GET /api/status)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          HOME: ${{ runner.temp }}/home
+        run: |
+          {
+            DEVELOP="$HOME/.local/bin/develop"
+            echo "== develop serve --port 8765 --no-browser (arrière-plan, 30 s au plus)"
+            "$DEVELOP" serve --port 8765 --no-browser > "$CI_LOGS/serve.log" 2>&1 &
+            SERVER_PID=$!
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:8765/api/status" -o "$CI_LOGS/status.json"; then ok=1; break; fi
+              if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "le serveur s'est arrêté avant de répondre"; break; fi
+              sleep 1
+            done
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+            echo "-- sortie du serveur :"
+            cat "$CI_LOGS/serve.log"
+            if [ "$ok" -ne 1 ]; then
+              echo "ÉCHEC : GET http://127.0.0.1:8765/api/status n'a pas répondu 200 en 30 s"
+              exit 1
+            fi
+            python3 -c 'import json, sys; d = json.load(open(sys.argv[1], encoding="utf-8")); print("GET /api/status : 200, version %s, needs_setup %s" % (d["version"], d["needs_setup"]))' "$CI_LOGS/status.json"
+          } 2>&1 | tee -a "$CI_LOGS/output.log"
+
+      # ---- Windows : install.ps1 sous Windows PowerShell 5.1 (comme chez l'utilisateur), DEVELOP_HOME redirigé
+      - name: install.ps1 (Windows PowerShell 5.1, DEVELOP_HOME redirigé)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DEVELOP_HOME: ${{ runner.temp }}\develop-home
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          New-Item -ItemType Directory -Force -Path $env:CI_LOGS | Out-Null
+          $log = Join-Path $env:CI_LOGS 'output.log'
+          function Step([string]$Title, [scriptblock]$Body) {
+            "== $Title" | Tee-Object -FilePath $log -Append
+            & $Body 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            if ($null -eq $code) { $code = 1 }
+            if ($code -ne 0) {
+              "ÉCHEC (code $code) : $Title" | Tee-Object -FilePath $log -Append
+              exit $code
+            }
+          }
+          Step "powershell -ExecutionPolicy Bypass -File install.ps1   (DEVELOP_HOME=$env:DEVELOP_HOME)" {
+            powershell -ExecutionPolicy Bypass -File install.ps1
+          }
+          $develop = Join-Path $env:DEVELOP_HOME 'bin\develop.cmd'
+          Step "$develop --version" { & $develop --version }
+          Step "develop doctor --json" { & $develop doctor --json }
+          Step "develop status --json" { & $develop status --json }
+          # Le dossier bin sera dans le PATH des étapes suivantes (comme après un nouveau terminal).
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:DEVELOP_HOME 'bin')
+
+      - name: Commande develop depuis le PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DEVELOP_HOME: ${{ runner.temp }}\develop-home
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = Join-Path $env:CI_LOGS 'output.log'
+          "== develop --version   (via le PATH)" | Tee-Object -FilePath $log -Append
+          develop --version 2>&1 | Tee-Object -FilePath $log -Append
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { $code = 1 }
+          exit $code
+
+      - name: Serveur (python -m develop serve --no-browser, puis GET /api/status) (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DEVELOP_HOME: ${{ runner.temp }}\develop-home
+        run: |
+          $ErrorActionPreference = 'Continue'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $log = Join-Path $env:CI_LOGS 'output.log'
+          $venvPython = Join-Path $env:DEVELOP_HOME 'venv\Scripts\python.exe'
+          $serveOut = Join-Path $env:CI_LOGS 'serve.out.log'
+          $serveErr = Join-Path $env:CI_LOGS 'serve.err.log'
+          "== python -m develop serve --port 8765 --no-browser (arrière-plan, 30 s au plus)" | Tee-Object -FilePath $log -Append
+          $proc = Start-Process -FilePath $venvPython -ArgumentList '-m', 'develop', 'serve', '--port', '8765', '--no-browser' `
+            -NoNewWindow -PassThru -RedirectStandardOutput $serveOut -RedirectStandardError $serveErr
+          $status = $null
+          foreach ($i in 1..30) {
+            if ($proc.HasExited) { "le serveur s'est arrêté avant de répondre (code $($proc.ExitCode))" | Tee-Object -FilePath $log -Append; break }
+            try {
+              $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/api/status' -UseBasicParsing -TimeoutSec 5
+              if ($resp.StatusCode -eq 200) { $status = $resp.Content; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force
+            $proc.WaitForExit(10000) | Out-Null
+          }
+          "-- sortie du serveur :" | Tee-Object -FilePath $log -Append
+          Get-Content -Path $serveOut, $serveErr -ErrorAction SilentlyContinue | Tee-Object -FilePath $log -Append
+          if (-not $status) {
+            "ÉCHEC : GET http://127.0.0.1:8765/api/status n'a pas répondu 200 en 30 s" | Tee-Object -FilePath $log -Append
+            exit 1
+          }
+          $json = $status | ConvertFrom-Json
+          "GET /api/status : 200, version $($json.version), needs_setup $($json.needs_setup)" | Tee-Object -FilePath $log -Append
+
+      - name: Sortie des scripts (artefact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-${{ matrix.os }}
+          path: ${{ runner.temp }}/ci-logs
+          if-no-files-found: warn
+          retention-days: 14
+
+  # --------------------------------------------------------------------------- compte rendu
+  report-failure:
+    name: report-failure
+    needs: [tests, install-scripts]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Télécharger tous les artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: "Créer ou mettre à jour l'issue « CI : échec »"
+        uses: actions/github-script@v7
+        env:
+          ARTIFACTS_DIR: artifacts
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const TITLE = process.env.CI_ISSUE_TITLE;
+            const TAIL = 150;
+            const MAX_SECTION_CHARS = 12000;
+            const MAX_BODY_CHARS = 60000;
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const sha = context.sha.slice(0, 7);
+
+            // Nom de l'artefact produit par un job (voir les champs « name » des jobs tests et install-scripts).
+            function artifactFor(jobName) {
+              let m = jobName.match(/^tests \(([^,]+), ([^)]+)\)$/);
+              if (m) return `pytest-${m[1]}-${m[2]}`;
+              m = jobName.match(/^install-scripts \(([^)]+)\)$/);
+              if (m) return `install-${m[1]}`;
+              return null;
+            }
+
+            function tail(file) {
+              const lines = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').split('\n');
+              while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+              let text = lines.slice(-TAIL).join('\n').replace(/```/g, "'''");
+              if (text.length > MAX_SECTION_CHARS) text = '[…]\n' + text.slice(-MAX_SECTION_CHARS);
+              return { text, total: lines.length };
+            }
+
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+              { owner, repo, run_id: context.runId, per_page: 100 });
+            const failed = jobs.filter(j => ['failure', 'timed_out', 'cancelled'].includes(j.conclusion));
+
+            const sections = [];
+            for (const job of failed) {
+              const steps = (job.steps || []).filter(s => s.conclusion === 'failure').map(s => s.name);
+              const lines = [`### ${job.name} — ${job.conclusion}`, '',
+                `- [Journal du job](${job.html_url})` + (steps.length ? ` — étape(s) en échec : ${steps.join(', ')}` : '')];
+              const artifact = artifactFor(job.name);
+              const file = artifact ? path.join(process.env.ARTIFACTS_DIR, artifact, 'output.log') : null;
+              if (file && fs.existsSync(file)) {
+                const { text, total } = tail(file);
+                lines.push(`- Artefact \`${artifact}\` (\`output.log\`, ${Math.min(total, TAIL)} dernières lignes sur ${total}) :`, '',
+                  '```text', text, '```');
+              } else {
+                lines.push(`- Aucune sortie capturée (le job a échoué avant la production de l'artefact${artifact ? ' `' + artifact + '`' : ''}) : voir le journal ci-dessus.`);
+              }
+              sections.push(lines.join('\n'));
+            }
+
+            let body = [
+              `## Échec de la CI`, '',
+              `- Exécution : ${runUrl}`,
+              `- Événement : \`${context.eventName}\` sur \`${context.ref}\`, commit \`${sha}\``,
+              `- Date : ${new Date().toISOString()}`,
+              `- Jobs en échec : ${failed.length}` + (failed.length ? ' — ' + failed.map(j => `\`${j.name}\``).join(', ') : ''),
+              '', ...sections, '',
+              `_Issue gérée automatiquement par le workflow CI (voir docs/CI.md) : mise à jour à chaque échec, fermée dès que la CI repasse au vert._`,
+            ].join('\n');
+            if (body.length > MAX_BODY_CHARS) body = body.slice(0, MAX_BODY_CHARS) + '\n\n[… corps tronqué, voir les artefacts de l’exécution]';
+
+            await core.summary.addRaw(body).write();
+
+            try {
+              const open = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 });
+              const existing = open.find(i => !i.pull_request && i.title === TITLE);
+              if (existing) {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+                await github.rest.issues.createComment({ owner, repo, issue_number: existing.number,
+                  body: `Nouvel échec : ${runUrl} (commit \`${sha}\`). Le corps de l'issue a été mis à jour.` });
+                core.info(`Issue #${existing.number} mise à jour.`);
+              } else {
+                const created = await github.rest.issues.create({ owner, repo, title: TITLE, body });
+                core.info(`Issue #${created.data.number} créée.`);
+              }
+            } catch (err) {
+              core.warning(`Impossible de créer ou mettre à jour l'issue « ${TITLE} » : ${err.message} ` +
+                `(jeton en lecture seule, par exemple pour une pull request venant d'un fork). Le compte rendu est dans le résumé de l'exécution.`);
+            }
+
+  report-success:
+    name: report-success
+    needs: [tests, install-scripts]
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: "Fermer l'issue « CI : échec » si elle est ouverte"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const TITLE = process.env.CI_ISSUE_TITLE;
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const sha = context.sha.slice(0, 7);
+            try {
+              const open = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 });
+              for (const issue of open.filter(i => !i.pull_request && i.title === TITLE)) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
+                  body: `CI au vert : ${runUrl} (\`${context.eventName}\` sur \`${context.ref}\`, commit \`${sha}\`). Issue fermée automatiquement.` });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed', state_reason: 'completed' });
+                core.info(`Issue #${issue.number} fermée.`);
+              }
+            } catch (err) {
+              core.warning(`Impossible de fermer l'issue « ${TITLE} » : ${err.message}`);
+            }

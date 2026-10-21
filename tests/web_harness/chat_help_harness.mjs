@@ -8,10 +8,10 @@
 // Usage : node chat_help_harness.mjs '<réponses des doublures en JSON>'
 //   { "profile": {...GET /api/system/profile}, "llm_test": {...POST /api/llm/test}, "status": {...GET /api/status} }
 import * as nodeModule from 'node:module';
-import { pathToFileURL } from 'node:url';
-import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const STATIC_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../develop/web/static');
+// fileURLToPath : valable aussi sous Windows (« new URL(...).pathname » y donne « /C:/... » et laisse les %20).
+const STATIC_DIR = fileURLToPath(new URL('../../develop/web/static', import.meta.url));
 
 // ------------------------------------------------------------------ DOM minimal
 class StubClassList {

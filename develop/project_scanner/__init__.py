@@ -23,6 +23,7 @@ from develop.project_scanner.scanner import (  # noqa: F401
     is_excluded_file_name,
     nfc,
     parse_gitignore,
+    path_is_within,
     read_text,
     scan_repo,
 )

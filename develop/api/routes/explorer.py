@@ -28,7 +28,7 @@ from fastapi import APIRouter, Query, Request
 from develop.api.routes import api_error, file_ref, get_state, repo_root, require_db
 from develop.api.state import AppState
 from develop.git_tools import GitError, GitRepo, find_git_root, git_available
-from develop.project_scanner import is_secret_file, read_text
+from develop.project_scanner import is_secret_file, path_is_within, read_text
 from develop.storage import Database, EndpointRow, FileRow, ModelRow, RelationRow, SymbolRow, node_key
 
 router = APIRouter(prefix="/api", tags=["explorer"])
@@ -267,7 +267,7 @@ def _read_lines(state: AppState, f: FileRow) -> Optional[List[str]]:
         real_path = os.path.realpath(abs_path)
     except OSError:
         return None
-    if real_path != real_root and not real_path.startswith(real_root + os.sep):
+    if not path_is_within(real_root, real_path):
         return None  # lien symbolique sortant du dépôt : refusé
     if not os.path.isfile(abs_path):
         return None

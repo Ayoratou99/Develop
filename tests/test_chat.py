@@ -1135,7 +1135,7 @@ def test_chat_event_to_sse_format():
     assert ev.to_sse() == 'event: delta\ndata: {"text": "é « ok »"}\n\n'
     assert ChatEvent("done").to_sse() == "event: done\ndata: {}\n\n"
     payload = json.loads(ChatEvent("x", {"p": Path("/tmp")}).to_sse().split("data: ", 1)[1])
-    assert payload == {"p": "/tmp"}
+    assert payload == {"p": str(Path("/tmp"))}  # « \tmp » sous Windows : c'est str() qui fait foi
 
 
 def test_find_invalid_citations():

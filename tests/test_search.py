@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1456,7 +1457,8 @@ def test_search_stays_fast_on_a_larger_index(tmp_path):
         r = engine.search("qui appelle Service42::handle42 commande client ?", query_vector=q, limit=20)
     elapsed = time.perf_counter() - t0
     assert r.hits and r.hits[0].source_type == "symbol" and r.semantic_available
-    assert elapsed < 2.0, "3 recherches sur 1500 morceaux en %.2fs" % elapsed
+    limit = 6.0 if sys.platform == "win32" else 2.0  # exécuteurs Windows de la CI nettement plus lents
+    assert elapsed < limit, "3 recherches sur 1500 morceaux en %.2fs" % elapsed
 
 
 def test_make_snippet_strips_tags_and_caps_length():

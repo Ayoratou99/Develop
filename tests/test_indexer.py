@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import threading
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -151,7 +152,7 @@ def test_first_run_indexes_everything(db: Database, workspace: WorkspaceConfig, 
     started = time.time()
     run = indexer.run()
     assert run.status == "ok" and run.error is None
-    assert time.time() - started < 3.0
+    assert time.time() - started < (10.0 if sys.platform == "win32" else 3.0)  # E/S fichier plus lentes sous Windows
 
     stats = run.stats
     for key in ("files_scanned", "files_indexed", "files_unchanged", "files_deleted", "files_skipped", "symbols",

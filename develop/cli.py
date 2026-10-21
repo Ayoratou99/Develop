@@ -36,6 +36,26 @@ class CliError(Exception):
 
 # --------------------------------------------------------------------------- aides
 
+def _configure_console() -> None:
+    """Sortie console tolérante : jamais d'``UnicodeEncodeError`` sur un accent, un « … » ou un « — ».
+
+    Sous Windows, ``sys.stdout`` redirigé (pipe, fichier) ou une console héritée encodent en cp1252/cp850 ;
+    on force l'UTF-8 et, partout, le remplacement des caractères non encodables. Aucun code ANSI n'est
+    émis par la CLI : rien ne suppose un terminal couleur.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+        except (ValueError, OSError, TypeError, AttributeError):  # flux déjà lu, fermé ou non standard
+            pass
+
+
 def _out(text: str = "") -> None:
     print(text)
 
@@ -83,7 +103,14 @@ def _parse_repo_spec(spec: str) -> RepoConfig:
 
 def _port_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform == "win32":
+            # Sous Windows, SO_REUSEADDR laisse bind() réussir sur un port déjà écouté : on demanderait alors
+            # à uvicorn un port occupé (WinError 10048). SO_EXCLUSIVEADDRUSE rend le test fiable.
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                s.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # tolère un port en TIME_WAIT
         try:
             s.bind((host, port))
         except OSError:
@@ -208,7 +235,7 @@ def cmd_app(args: argparse.Namespace) -> int:
     webview = _load_webview()
     if webview is None:
         _out("La fenêtre Develop nécessite pywebview, qui n'est pas installé :")
-        _out("  pip install \"develop-local[desktop]\"   (ou : sh install.sh --desktop)")
+        _out("  pip install \"develop-local[desktop]\"   (ou : sh install.sh --desktop ; install.ps1 -Desktop sous Windows)")
         _out("Repli : ouverture dans le navigateur, comme « develop serve ».")
         return cmd_serve(argparse.Namespace(host=APP_HOST, port=args.port, no_browser=False,
                                             workspace=args.workspace))
@@ -758,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    _configure_console()
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     if not getattr(args, "func", None):
