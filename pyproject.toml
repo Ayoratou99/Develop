@@ -49,7 +49,7 @@ desktop = [  # fenêtre native « develop app »
 develop = "develop.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/pamstore/Develop"
+Homepage = "https://github.com/Ayoratou99/Develop"
 
 [tool.setuptools.packages.find]
 where = ["."]

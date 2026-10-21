@@ -52,13 +52,13 @@ Develop s'installe comme un outil Python, en une commande, sans Docker ni sudo :
 **macOS / Linux**
 
 ```bash
-git clone https://github.com/pamstore/Develop.git && cd Develop && sh install.sh
+git clone https://github.com/Ayoratou99/Develop.git && cd Develop && sh install.sh
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-git clone https://github.com/pamstore/Develop.git; cd Develop; powershell -ExecutionPolicy Bypass -File install.ps1
+git clone https://github.com/Ayoratou99/Develop.git; cd Develop; powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
 Le script vérifie Python ≥ 3.9 (et indique comment l'installer sinon : Homebrew ou python.org, winget sous Windows),
