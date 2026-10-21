@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "develop-local"
+version = "0.1.0"
+description = "Develop : mémoire locale et assistant hors ligne pour comprendre un projet logiciel et suivre ses changements."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Develop contributors" }]
+keywords = ["developer-tools", "local-first", "offline", "llm", "ollama", "code-analysis", "rag"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development",
+]
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "httpx>=0.27",
+  "pydantic>=2.5",
+  "numpy>=1.24",
+  "pypdf>=4.0",
+  "python-multipart>=0.0.9",
+  "typing_extensions>=4.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+docx = ["python-docx>=1.1"]
+watch = ["watchfiles>=0.21"]
+sysinfo = ["psutil>=5.9"]
+desktop = [  # fenêtre native « develop app »
+  "pywebview>=5",
+  # pyobjc 12.0 accepte Python 3.9 dans ses métadonnées mais ne fournit plus de wheels cp39 (compilation
+  # impossible sans SDK) : sur macOS avec Python 3.9, rester en 11.x.
+  "pyobjc-core<12; python_version < '3.10' and sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa<12; python_version < '3.10' and sys_platform == 'darwin'",
+  "pyobjc-framework-Quartz<12; python_version < '3.10' and sys_platform == 'darwin'",
+  "pyobjc-framework-WebKit<12; python_version < '3.10' and sys_platform == 'darwin'",
+  "pyobjc-framework-Security<12; python_version < '3.10' and sys_platform == 'darwin'",
+  "pyobjc-framework-UniformTypeIdentifiers<12; python_version < '3.10' and sys_platform == 'darwin'",
+]
+
+[project.scripts]
+develop = "develop.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pamstore/Develop"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["develop*"]
+
+[tool.setuptools.package-data]
+develop = ["web/**/*", "llm/*.json", "llm/**/*.md", "storage/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

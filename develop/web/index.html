@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Develop</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <!-- Modules ES chargés sans aucune dépendance externe (fonctionnement hors ligne). -->
+  <link rel="modulepreload" href="/static/api.js">
+  <link rel="modulepreload" href="/static/ui.js">
+  <link rel="modulepreload" href="/static/views/setup.js">
+  <link rel="modulepreload" href="/static/views/chat.js">
+  <link rel="modulepreload" href="/static/views/explorer.js">
+  <link rel="modulepreload" href="/static/views/documents.js">
+  <link rel="modulepreload" href="/static/views/notes.js">
+  <link rel="modulepreload" href="/static/views/impact.js">
+  <link rel="modulepreload" href="/static/views/settings.js">
+</head>
+<body>
+  <aside class="sidebar" aria-label="Navigation principale">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">D</span>
+      <span class="brand-name">Develop</span>
+    </div>
+    <nav id="nav" class="nav"></nav>
+    <div id="status-panel" class="status-panel" aria-live="polite">
+      <div class="status-line"><span class="dot dot-neutral"></span><span>Connexion…</span></div>
+    </div>
+  </aside>
+  <main id="main" class="main" tabindex="-1"></main>
+  <noscript>
+    <div class="page">Develop a besoin de JavaScript pour fonctionner (aucune ressource externe n'est chargée).</div>
+  </noscript>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
